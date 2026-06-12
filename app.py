@@ -3,9 +3,15 @@ import pandas as pd
 import os
 import plotly.graph_objects as go
 from sqlalchemy import create_engine, URL
-from dotenv import load_dotenv
 
-load_dotenv()
+# =====================================
+# HELPER — lê de st.secrets ou os.environ
+# =====================================
+def get_secret(key, default=None):
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key, default)
 
 # =====================================
 # HELPER — trata NaN e None com segurança
@@ -24,11 +30,11 @@ def safe_float(val, default=0.0):
 def buscar_dados():
     url = URL.create(
         "postgresql+psycopg2",
-        username=os.getenv("REMOTE_DB_USER", "postgres"),
-        password=os.getenv("REMOTE_DB_PASS"),
-        host=os.getenv("REMOTE_DB_HOST", "177.22.38.27"),
-        port=os.getenv("REMOTE_DB_PORT", "6432"),
-        database=os.getenv("REMOTE_DB_NAME", "painel_ateg"),
+        username=get_secret("REMOTE_DB_USER", "postgres"),
+        password=get_secret("REMOTE_DB_PASS"),
+        host=get_secret("REMOTE_DB_HOST", "177.22.38.27"),
+        port=get_secret("REMOTE_DB_PORT", "6432"),
+        database=get_secret("REMOTE_DB_NAME", "painel_ateg"),
     )
     query = """
     -- Camada 1: calcula MIN/MAX por supervisor
