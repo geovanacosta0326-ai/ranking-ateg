@@ -145,7 +145,7 @@ st.set_page_config(page_title="Ranking ATeG", page_icon="🏆", layout="wide", i
 st.markdown("""
 <style>
 html, body, [data-testid="stAppViewContainer"] { background: #f0f2f6; }
-[data-testid="stAppViewContainer"] > .main > .block-container { max-width: 1200px; padding: 0rem 2rem 3rem; margin-top: -80px; }
+[data-testid="stAppViewContainer"] > .main > .block-container { max-width: 1200px; padding: 0rem 2rem 3rem; margin-top: -130px; }
 header[data-testid="stHeader"] { display: none; }
 div[data-testid="stDecoration"] { display: none; }
 #MainMenu { display: none; }
