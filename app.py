@@ -153,9 +153,129 @@ def listar_tabelas():
     except Exception as e:
         return pd.DataFrame({"erro": [str(e)]})
 
+@st.cache_data(ttl=60)
+def fonte_do_supervisor():
+    """Diz de onde o ranking está tirando o supervisor: (usa_planilha, qtd, banco)."""
+    try:
+        eng = get_engine()
+        banco = eng.url.database
+        with eng.connect() as c:
+            if not c.execute(text("SELECT to_regclass('public.supervisor_tecnico_periodo') IS NOT NULL")).scalar():
+                return False, 0, banco
+            return True, c.execute(text("SELECT COUNT(*) FROM public.supervisor_tecnico_periodo")).scalar(), banco
+    except Exception:
+        return False, 0, "?"
+
+
 @st.cache_data(ttl=600)
 def buscar_dados(dt_inicio: str, dt_fim: str):
     engine = get_engine()
+
+    # Supervisor do técnico NO PERÍODO: vem da planilha do Relatório Mensal
+    # (tabela public.supervisor_tecnico_periodo, carregada por
+    # importar_supervisores_mensal.py) — fonte oficial, com início e fim de
+    # cada relatório. Sem relatório no período, vale o relatório mais recente
+    # do técnico (até 180 dias antes). A API (supervisor_atual da visita) fica
+    # só como último recurso, ou se a tabela ainda não tiver sido importada.
+    cte_supervisor_atual_api = """UltimoSupervisorAtualPorTecnico AS (
+    SELECT DISTINCT ON (tecnico_responsavel)
+        tecnico_responsavel,
+        supervisor_atual AS ultimo_supervisor
+    FROM VisitasComRank
+    ORDER BY tecnico_responsavel, dt_visita_original DESC
+),"""
+    cte_supervisor_atual_relatorio = """UltimoSupervisorAtualPorTecnico AS (
+    SELECT u.tecnico_responsavel,
+           COALESCE(rm.supervisor, u.supervisor_visita) AS ultimo_supervisor
+    FROM (
+        SELECT DISTINCT ON (tecnico_responsavel)
+            tecnico_responsavel,
+            supervisor_atual AS supervisor_visita
+        FROM VisitasComRank
+        ORDER BY tecnico_responsavel, dt_visita_original DESC
+    ) u
+    LEFT JOIN LATERAL (
+        SELECT s.supervisor
+        FROM public.supervisor_tecnico_periodo s
+        WHERE s.tecnico_norm = trim(regexp_replace(
+                  translate(upper(u.tecnico_responsavel),
+                            'ÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ', 'AAAAAEEEEIIIIOOOOOUUUUC'),
+                  '\\s+', ' ', 'g'))
+          AND s.dt_inicio <= (SELECT dt_fim FROM Parametros)
+          -- 1º: relatório que cruza o período; 2º (técnico sem relatório no
+          -- período): o relatório mais recente, até 180 dias antes do início
+          AND s.dt_fim    >= (SELECT dt_inicio FROM Parametros) - 180
+        ORDER BY (s.dt_fim >= (SELECT dt_inicio FROM Parametros)) DESC,
+                 s.dt_inicio DESC, s.dt_fim DESC
+        LIMIT 1
+    ) rm ON TRUE
+),"""
+    # FONTE OFICIAL (igual ao Sistema de Avaliação de Técnicos): o supervisor é
+    # o do VÍNCULO do técnico (tabela public.vinculo_tecnico) no último dia do
+    # mês final do período — mesma regra de tecnicos_do_supervisor_no_mes():
+    #   1) vínculo ativo cujo início efetivo é <= fim do mês;
+    #   2) vínculo encerrado DEPOIS do fim do mês por "Mudança de supervisor"
+    #      ou "Técnico desativado" (ele ainda era daquele supervisor no mês).
+    # Técnico sem vínculo no mês fica no grupo "SEM VÍNCULO NO MÊS".
+    _norm = ("trim(regexp_replace(translate(upper({c}), "
+             "'ÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ', 'AAAAAEEEEIIIIOOOOOUUUUC'), '\\s+', ' ', 'g'))")
+    cte_supervisor_atual_vinculo = f"""UltimoSupervisorAtualPorTecnico AS (
+    SELECT u.tecnico_responsavel,
+           COALESCE(vm.supervisor, 'SEM VÍNCULO NO MÊS') AS ultimo_supervisor
+    FROM (
+        SELECT DISTINCT tecnico_responsavel FROM VisitasComRank
+    ) u
+    LEFT JOIN LATERAL (
+        SELECT b.supervisor
+        FROM (
+            SELECT v.supervisor, v.data_desvinculacao, v.motivo_desvinculacao,
+                   GREATEST(
+                       v.data_inicio,
+                       COALESCE((
+                           SELECT MAX(p.data_desvinculacao)
+                           FROM public.vinculo_tecnico p
+                           WHERE p.id <> v.id
+                             AND p.supervisor <> v.supervisor
+                             AND p.data_desvinculacao IS NOT NULL
+                             AND p.motivo_desvinculacao LIKE 'Mudança de supervisor%'
+                             AND {_norm.format(c='p.tecnico')} = {_norm.format(c='v.tecnico')}
+                             AND p.data_desvinculacao <= COALESCE(v.data_desvinculacao, CURRENT_DATE)
+                       ), v.data_inicio)
+                   ) AS inicio_efetivo
+            FROM public.vinculo_tecnico v
+            WHERE {_norm.format(c='v.tecnico')} = {_norm.format(c='u.tecnico_responsavel')}
+        ) b
+        WHERE b.inicio_efetivo <= (date_trunc('month', (SELECT dt_fim FROM Parametros))
+                                   + interval '1 month - 1 day')::date
+          AND (
+                b.data_desvinculacao IS NULL
+                OR ((b.motivo_desvinculacao LIKE 'Mudança de supervisor%'
+                     OR b.motivo_desvinculacao LIKE 'Técnico desativado%')
+                    AND b.data_desvinculacao >= (date_trunc('month', (SELECT dt_fim FROM Parametros))
+                                                 + interval '1 month - 1 day')::date)
+              )
+        ORDER BY b.inicio_efetivo DESC
+        LIMIT 1
+    ) vm ON TRUE
+),"""
+    try:
+        with engine.connect() as _c:
+            _tem_vinculo = _c.execute(
+                text("SELECT to_regclass('public.vinculo_tecnico') IS NOT NULL")
+            ).scalar()
+            _tem_tabela = _c.execute(
+                text("SELECT to_regclass('public.supervisor_tecnico_periodo') IS NOT NULL")
+            ).scalar()
+    except Exception:
+        _tem_vinculo = False
+        _tem_tabela = False
+    if _tem_vinculo:
+        cte_supervisor_atual = cte_supervisor_atual_vinculo
+    else:
+        cte_supervisor_atual = (
+            cte_supervisor_atual_relatorio if _tem_tabela else cte_supervisor_atual_api
+        )
+
     query = f"""
 WITH Parametros AS (
     SELECT
@@ -259,13 +379,7 @@ PropriedadesInativasDoAno AS (
 --    (usando TODAS as visitas do período, SEM cap — precisa
 --     refletir a visita mais recente de fato, não a 30ª mais antiga)
 -- ══════════════════════════════════════════════════════════
-UltimoSupervisorAtualPorTecnico AS (
-    SELECT DISTINCT ON (tecnico_responsavel)
-        tecnico_responsavel,
-        supervisor_atual AS ultimo_supervisor
-    FROM VisitasComRank
-    ORDER BY tecnico_responsavel, dt_visita_original DESC
-),
+{cte_supervisor_atual}
 
 UltimoSupervisorAnteriorPorTecnico AS (
     SELECT DISTINCT ON (tecnico_responsavel)
@@ -945,6 +1059,14 @@ col_user, col_logout = st.columns([5, 1])
 with col_user:
     _rotulo_sessao = "Administrador (vê todos os supervisores)" if st.session_state.get("admin") else f"Supervisor: {st.session_state.get('supervisor_logado')}"
     st.caption(f"👤 {_rotulo_sessao}")
+    _usa, _qtd, _banco = fonte_do_supervisor()
+    if _usa and _qtd > 0:
+        st.caption(f"🧭 Supervisor pela planilha do Relatório Mensal ({_qtd:,} relatórios)".replace(",", "."))
+    else:
+        st.warning(
+            f"Supervisor ainda vindo da API: a tabela supervisor_tecnico_periodo "
+            f"não foi encontrada (ou está vazia) no banco '{_banco}'."
+        )
 with col_logout:
     if st.button("Sair", use_container_width=True, key="btn_sair"):
         for _k in ("autenticado", "usuario_logado", "admin", "supervisor_logado", "precisa_trocar_senha", "mostrar_troca_senha"):
