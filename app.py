@@ -46,6 +46,89 @@ def _texto_heatmap(row, col, colunas_absolutas):
         return "Não avaliado" if pd.isna(valor_abs) else fmt.format(safe_float(valor_abs))
     return fmt.format(safe_float(valor_abs)) + f" ({safe_float(row[col]) * 10:.1f})"
 
+
+def _texto_celula_heatmap(row, col, colunas_absolutas):
+    """
+    Texto CURTO dentro da célula (só o valor absoluto) — a nota entre
+    parênteses fica no hover, senão não cabe com 8 colunas.
+    """
+    col_abs, fmt = colunas_absolutas[col]
+    valor_abs = row[col_abs]
+    if col == "n_avaliacao_subjetiva" and pd.isna(valor_abs):
+        return "—"
+    return fmt.format(safe_float(valor_abs))
+
+
+_CONECTORES_NOME = {"DA", "DE", "DO", "DAS", "DOS", "E"}
+
+
+def _abreviar_nome(nome):
+    """'FRANCISCO GLEISON RIBEIRO DOS SANTOS ARAÚJO' -> 'FRANCISCO G. R. S. ARAÚJO'."""
+    partes = str(nome).split()
+    if len(partes) <= 2:
+        return str(nome)
+    meio = [p[0] + "." for p in partes[1:-1] if p.upper() not in _CONECTORES_NOME]
+    return " ".join([partes[0]] + meio + [partes[-1]])
+
+
+# Rótulos curtos (2 linhas) das colunas do heatmap, sem inclinar o texto
+ROTULOS_HEATMAP = {
+    "n_prop_ativas":         "Prop.<br>Ativas",
+    "n_prop_inativas":       "Prop.<br>Inativas",
+    "n_total_visitas":       "Total<br>Visitas",
+    "n_taxa_validade":       "Visitas<br>Válidas",
+    "n_ori_geral":           "Total<br>Orient.",
+    "n_taxa_ori_concluidas": "Orient.<br>Concl.",
+    "n_multi_projetos":      "Repet.<br>Projeto",
+    "n_avaliacao_subjetiva": "Aval.<br>Superv.",
+}
+
+
+def montar_heatmap(df_plot, col_nome, indicadores, colunas_absolutas, abreviar=False):
+    """Heatmap 'Score por indicador' (usado no ranking de técnicos e de supervisores)."""
+    chaves = list(indicadores.keys())
+    nomes = df_plot[col_nome].tolist()
+    z = [[_valor_heatmap(row, c) for c in chaves] for _, row in df_plot.iterrows()]
+    texto = [[_texto_celula_heatmap(row, c, colunas_absolutas) for c in chaves] for _, row in df_plot.iterrows()]
+    hover = [[f"{row[col_nome]}<br>{indicadores[c]}: {_texto_heatmap(row, c, colunas_absolutas)}" for c in chaves]
+             for _, row in df_plot.iterrows()]
+    labels = [ROTULOS_HEATMAP.get(c, indicadores[c]) for c in chaves]
+
+    fig = go.Figure(go.Heatmap(
+        z=z, x=labels, y=nomes,
+        colorscale=[[0.0,"#c96a4d"],[0.35,"#e8c48a"],[0.6,"#cfe3d5"],[0.8,"#5b9e6f"],[1.0,"#14532d"]], zmin=0, zmax=1, showscale=True,
+        colorbar=dict(thickness=10, len=0.6, tickformat=".0%", x=1.0),
+        xgap=2, ygap=2,
+        customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>",
+    ))
+
+    annotations = []
+    for i, row_vals in enumerate(z):
+        for j, val in enumerate(row_vals):
+            if val is None:
+                txt_color = "#5b6b60"
+            else:
+                txt_color = "#14261a" if 0.25 <= val <= 0.75 else "white"
+            annotations.append(dict(
+                x=labels[j], y=nomes[i], text=texto[i][j], showarrow=False,
+                font=dict(size=11, color=txt_color), xref="x", yref="y",
+            ))
+
+    fig.update_layout(
+        height=max(200, len(nomes) * 34 + 70),
+        margin=dict(l=0, r=0, t=50, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(size=11, color="#14261a"),
+        xaxis=dict(side="top", tickangle=0, tickfont=dict(size=10, color="#14261a"), domain=[0, 0.94]),
+        yaxis=dict(
+            autorange="reversed", tickfont=dict(size=10, color="#14261a"), automargin=True,
+            tickvals=nomes, ticktext=[_abreviar_nome(n) for n in nomes] if abreviar else nomes,
+        ),
+        annotations=annotations,
+    )
+    return fig
+
 def recalcular_scores(df_grupo):
     """
     Tabela fixa de critérios (não é mais min-max relativo ao grupo).
@@ -1549,53 +1632,7 @@ if pagina == "Ranking de Supervisores":
                 "n_avaliacao_subjetiva": ("avaliacao_subjetiva",        "{:.1f}"),
             }
 
-            z_sup = [[_valor_heatmap(row, col) for col in indicadores_sup.keys()] for _, row in df_supv.iterrows()]
-            sup_names = df_supv["supervisor"].tolist()
-            labels_sup = list(indicadores_sup.values())
-
-            # Texto exibido na célula = valor absoluto; hover mostra valor absoluto + score normalizado
-            abs_vals_sup = [
-                [safe_float(row[colunas_absolutas_sup[col][0]]) for col in indicadores_sup.keys()]
-                for _, row in df_supv.iterrows()
-            ]
-            text_abs_sup = [
-                [_texto_heatmap(row, col, colunas_absolutas_sup) for col in indicadores_sup.keys()]
-                for _, row in df_supv.iterrows()
-            ]
-
-            fig_sup = go.Figure(go.Heatmap(
-                z=z_sup, x=labels_sup, y=sup_names,
-                colorscale=[[0.0,"#c96a4d"],[0.35,"#e8c48a"],[0.6,"#cfe3d5"],[0.8,"#5b9e6f"],[1.0,"#14532d"]], zmin=0, zmax=1, showscale=True,
-                colorbar=dict(thickness=12, len=0.8, tickformat=".0%"),
-                xgap=2, ygap=2,
-                customdata=abs_vals_sup,
-                hovertemplate="%{y}<br>%{x}: valor %{customdata} · score %{z:.4f}<extra></extra>",
-            ))
-
-            ann_sup = []
-            for i, row_vals in enumerate(z_sup):
-                for j, val in enumerate(row_vals):
-                    if val is None:
-                        txt_color = "#5b6b60"
-                    else:
-                        txt_color = "#14261a" if 0.25 <= val <= 0.75 else "white"
-                    ann_sup.append(dict(
-                        x=labels_sup[j], y=sup_names[i],
-                        text=text_abs_sup[i][j],
-                        showarrow=False,
-                        font=dict(size=10, color=txt_color),
-                        xref="x", yref="y",
-                    ))
-
-            fig_sup.update_layout(
-                height=max(200, len(sup_names) * 38 + 60),
-                margin=dict(l=0, r=10, t=10, b=10),
-                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(size=11, color="#14261a"),
-                xaxis=dict(side="top", tickangle=-30, tickfont=dict(color="#14261a"), domain=[0, 0.72]),
-                yaxis=dict(autorange="reversed", tickfont=dict(color="#14261a")),
-                annotations=ann_sup,
-            )
+            fig_sup = montar_heatmap(df_supv, "supervisor", indicadores_sup, colunas_absolutas_sup, abreviar=True)
             st.plotly_chart(fig_sup, use_container_width=True)
 
     with tab_dist_sup:
@@ -1987,56 +2024,8 @@ with tab1_tec:
             "n_avaliacao_subjetiva": ("avaliacao_subjetiva",        "{:.1f}"),
         }
 
-        chart_df  = df_sup.sort_values("nota_final", ascending=False).copy()
-        z         = [[_valor_heatmap(row, col) for col in indicadores.keys()] for _, row in chart_df.iterrows()]
-        tecnicos  = chart_df["tecnico_responsavel"].tolist()
-        labels    = list(indicadores.values())
-
-        # Texto exibido na célula = valor absoluto; hover mostra valor absoluto + score normalizado
-        abs_vals = [
-            [safe_float(row[colunas_absolutas[col][0]]) for col in indicadores.keys()]
-            for _, row in chart_df.iterrows()
-        ]
-        text_abs = [
-            [_texto_heatmap(row, col, colunas_absolutas) for col in indicadores.keys()]
-            for _, row in chart_df.iterrows()
-        ]
-
-        fig = go.Figure(go.Heatmap(
-            z=z, x=labels, y=tecnicos,
-            colorscale=[[0.0,"#c96a4d"],[0.35,"#e8c48a"],[0.6,"#cfe3d5"],[0.8,"#5b9e6f"],[1.0,"#14532d"]], zmin=0, zmax=1, showscale=True,
-            colorbar=dict(thickness=12, len=0.8, tickformat=".0%"),
-            xgap=2, ygap=2,
-            customdata=abs_vals,
-            hovertemplate="%{y}<br>%{x}: valor %{customdata} · score %{z:.4f}<extra></extra>",
-        ))
-
-        # Anotações com cor dinâmica: branco em verde/vermelho escuro, preto no amarelo/laranja
-        annotations = []
-        for i, row_vals in enumerate(z):
-            for j, val in enumerate(row_vals):
-                # RdYlGn: ~0.3–0.7 são tons claros (amarelo/laranja) → texto escuro
-                if val is None:
-                    txt_color = "#5b6b60"
-                else:
-                    txt_color = "#14261a" if 0.25 <= val <= 0.75 else "white"
-                annotations.append(dict(
-                    x=labels[j], y=tecnicos[i],
-                    text=text_abs[i][j],
-                    showarrow=False,
-                    font=dict(size=10, color=txt_color),
-                    xref="x", yref="y",
-                ))
-
-        fig.update_layout(
-            height=max(200, len(tecnicos) * 38 + 60),
-            margin=dict(l=0, r=10, t=10, b=10),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(size=11, color="#14261a"),
-            xaxis=dict(side="top", tickangle=-30, tickfont=dict(color="#14261a"), domain=[0, 0.72]),
-            yaxis=dict(autorange="reversed", tickfont=dict(color="#14261a")),
-            annotations=annotations,
-        )
+        chart_df = df_sup.sort_values("nota_final", ascending=False).copy()
+        fig = montar_heatmap(chart_df, "tecnico_responsavel", indicadores, colunas_absolutas, abreviar=True)
         st.plotly_chart(fig, use_container_width=True)
 
 with tab_dist_tec:
