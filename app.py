@@ -258,6 +258,46 @@ def buscar_dados(dt_inicio: str, dt_fim: str):
         LIMIT 1
     ) vm ON TRUE
 ),"""
+    # Técnicos que a AVALIAÇÃO lista para o supervisor no mês, mesmo sem nenhuma
+    # visita no período (ex.: de férias/afastado). Entram no ranking com zeros,
+    # para a lista ser a mesma da avaliação.
+    cte_tecnicos_vinculo_mes = f"""TecnicosVinculoMes AS (
+    SELECT n.tecnico, vm.supervisor
+    FROM (SELECT DISTINCT tecnico FROM public.vinculo_tecnico) n
+    LEFT JOIN LATERAL (
+        SELECT b.supervisor
+        FROM (
+            SELECT v.supervisor, v.data_desvinculacao, v.motivo_desvinculacao,
+                   GREATEST(
+                       v.data_inicio,
+                       COALESCE((
+                           SELECT MAX(p.data_desvinculacao)
+                           FROM public.vinculo_tecnico p
+                           WHERE p.id <> v.id
+                             AND p.supervisor <> v.supervisor
+                             AND p.data_desvinculacao IS NOT NULL
+                             AND p.motivo_desvinculacao LIKE 'Mudança de supervisor%'
+                             AND {_norm.format(c='p.tecnico')} = {_norm.format(c='v.tecnico')}
+                             AND p.data_desvinculacao <= COALESCE(v.data_desvinculacao, CURRENT_DATE)
+                       ), v.data_inicio)
+                   ) AS inicio_efetivo
+            FROM public.vinculo_tecnico v
+            WHERE {_norm.format(c='v.tecnico')} = {_norm.format(c='n.tecnico')}
+        ) b
+        WHERE b.inicio_efetivo <= (date_trunc('month', (SELECT dt_fim FROM Parametros))
+                                   + interval '1 month - 1 day')::date
+          AND (
+                b.data_desvinculacao IS NULL
+                OR ((b.motivo_desvinculacao LIKE 'Mudança de supervisor%'
+                     OR b.motivo_desvinculacao LIKE 'Técnico desativado%')
+                    AND b.data_desvinculacao >= (date_trunc('month', (SELECT dt_fim FROM Parametros))
+                                                 + interval '1 month - 1 day')::date)
+              )
+        ORDER BY b.inicio_efetivo DESC
+        LIMIT 1
+    ) vm ON TRUE
+    WHERE vm.supervisor IS NOT NULL
+),"""
     try:
         with engine.connect() as _c:
             _tem_vinculo = _c.execute(
@@ -270,11 +310,28 @@ def buscar_dados(dt_inicio: str, dt_fim: str):
         _tem_vinculo = False
         _tem_tabela = False
     if _tem_vinculo:
-        cte_supervisor_atual = cte_supervisor_atual_vinculo
+        cte_supervisor_atual = cte_supervisor_atual_vinculo + "\n" + cte_tecnicos_vinculo_mes
     else:
         cte_supervisor_atual = (
             cte_supervisor_atual_relatorio if _tem_tabela else cte_supervisor_atual_api
         )
+
+    if _tem_vinculo:
+        _union_sem_visita = f"""
+    UNION ALL
+    SELECT tv.tecnico, 0, 0, 0, 0, 0, 0, 0, 0::NUMERIC, 0::NUMERIC, 0
+    FROM TecnicosVinculoMes tv
+    WHERE {_norm.format(c='tv.tecnico')} NOT IN (
+        SELECT {_norm.format(c='t0.tecnico_responsavel')} FROM Taxas t0
+        WHERE t0.tecnico_responsavel IS NOT NULL
+    )
+"""
+    else:
+        _union_sem_visita = ""
+    _join_tvm = (
+        "    LEFT JOIN TecnicosVinculoMes tvm ON tvm.tecnico = t.tecnico_responsavel"
+        if _tem_vinculo else "    LEFT JOIN (SELECT NULL::text AS tecnico, NULL::text AS supervisor) tvm ON FALSE"
+    )
 
     query = f"""
 WITH Parametros AS (
@@ -457,10 +514,14 @@ Taxas AS (
     WHERE r.propriedades_ativas > 0
 ),
 
-Normalizado AS (
+TaxasTodos AS (
+    SELECT * FROM Taxas{_union_sem_visita}
+),
+
+NormalizadoBase AS (
     SELECT
         t.tecnico_responsavel,
-        sa.ultimo_supervisor,
+        COALESCE(sa.ultimo_supervisor, tvm.supervisor) AS ultimo_supervisor,
         san.ultimo_supervisor_anterior,
         pr.ultimo_projeto,
         at.ultima_atividade,
@@ -512,11 +573,40 @@ Normalizado AS (
         -- Repetição de Projeto: binário — 0 repetições=10, 1 ou mais=5
         (CASE WHEN t.qtd_multiplos_projetos = 0 THEN 10 ELSE 5 END) / 10.0 AS n_multi_projetos
 
-    FROM Taxas t
+    FROM TaxasTodos t
     LEFT JOIN UltimoSupervisorAtualPorTecnico    sa  ON t.tecnico_responsavel = sa.tecnico_responsavel
+{_join_tvm}
     LEFT JOIN UltimoSupervisorAnteriorPorTecnico san ON t.tecnico_responsavel = san.tecnico_responsavel
     LEFT JOIN UltimoProjetoPorTecnico            pr  ON t.tecnico_responsavel = pr.tecnico_responsavel
     LEFT JOIN UltimaAtividadePorTecnico          at  ON t.tecnico_responsavel = at.tecnico_responsavel
+),
+
+-- Técnico sem nenhuma visita no período (veio da lista da avaliação): nota 0.
+Normalizado AS (
+    SELECT
+        tecnico_responsavel,
+        ultimo_supervisor,
+        ultimo_supervisor_anterior,
+        ultimo_projeto,
+        ultima_atividade,
+        propriedades_ativas,
+        propriedades_inativas,
+        total_de_visitas,
+        total_visitas_presenciais,
+        total_visitas_validas,
+        total_orientacoes_geral,
+        total_orientacoes_concluidas,
+        qtd_multiplos_projetos,
+        pct_visitas_validas,
+        pct_ori_concluidas,
+        CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_prop_ativas END AS n_prop_ativas,
+        CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_total_visitas END AS n_total_visitas,
+        CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_ori_geral END AS n_ori_geral,
+        CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_taxa_validade END AS n_taxa_validade,
+        CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_taxa_ori_concluidas END AS n_taxa_ori_concluidas,
+        CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_prop_inativas END AS n_prop_inativas,
+        CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_multi_projetos END AS n_multi_projetos
+    FROM NormalizadoBase
 )
 SELECT
     tecnico_responsavel,
@@ -1396,15 +1486,15 @@ if pagina == "Ranking de Supervisores":
             </div>
             <div class="metric-card red">
                 <div class="label">📉 Pior Equipe</div>
-                <div class="value">{safe_float(df_supv['nota_final'].min())*100:.1f}%</div>
+                <div class="value">{safe_float(df_supv[df_supv['total_de_visitas'] > 0]['nota_final'].min())*100:.1f}%</div>
             </div>
             <div class="metric-card yellow">
                 <div class="label">✅ Média Visitas Válidas</div>
-                <div class="value">{safe_float(df_supv['pct_visitas_validas'].mean()):.1f}%</div>
+                <div class="value">{safe_float(df_supv[df_supv['total_de_visitas'] > 0]['pct_visitas_validas'].mean()):.1f}%</div>
             </div>
             <div class="metric-card purple">
                 <div class="label">✔️ Média Orient. Concl.</div>
-                <div class="value">{safe_float(df_supv['pct_ori_concluidas'].mean()):.1f}%</div>
+                <div class="value">{safe_float(df_supv[df_supv['total_de_visitas'] > 0]['pct_ori_concluidas'].mean()):.1f}%</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1825,8 +1915,8 @@ df_sup = recalcular_scores(df_sup).sort_values("nota_final", ascending=False).re
 tab1_tec, tab_dist_tec, tab2_tec = st.tabs(["🏆 Ranking", "📊 Distribuição de Propriedades x Orientações", "🔎 Detalhes por Técnico"])
 with tab1_tec:
     # ── MÉTRICAS ─────────────────────────────────────────────────────────────────
-    media_validas = df_sup["pct_visitas_validas"].mean()
-    media_ori     = df_sup["pct_ori_concluidas"].mean()
+    media_validas = df_sup[df_sup["total_de_visitas"] > 0]["pct_visitas_validas"].mean()
+    media_ori     = df_sup[df_sup["total_de_visitas"] > 0]["pct_ori_concluidas"].mean()
     st.markdown(f"""
     <div class="metric-strip">
         <div class="metric-card">
@@ -1839,7 +1929,7 @@ with tab1_tec:
         </div>
         <div class="metric-card red">
             <div class="label">📉 Pior Score</div>
-            <div class="value">{safe_float(df_sup['nota_final'].min())*100:.1f}%</div>
+            <div class="value">{safe_float(df_sup[df_sup['total_de_visitas'] > 0]['nota_final'].min())*100:.1f}%</div>
         </div>
         <div class="metric-card yellow">
             <div class="label">✅ Média Visitas Válidas</div>
@@ -1863,7 +1953,7 @@ with tab1_tec:
             pct  = nota * 100
             medalha = "🥇" if pos==1 else "🥈" if pos==2 else "🥉" if pos==3 else f"#{pos}"
             classe  = "gold" if pos==1 else "silver" if pos==2 else "bronze" if pos==3 else ""
-            cap_tag = " ⏱️" if safe_float(row["total_de_visitas"]) == 30 else ""
+            cap_tag = " ⏱️" if safe_float(row["total_de_visitas"]) == 30 else (" · sem visitas no mês" if safe_float(row["total_de_visitas"]) == 0 else "")
             st.markdown(f"""
             <div class="rank-row {classe}">
                 <span class="rank-pos">{medalha}</span>
