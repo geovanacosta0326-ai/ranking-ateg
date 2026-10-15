@@ -252,6 +252,8 @@ def fonte_do_supervisor():
 
 @st.cache_data(ttl=600)
 def buscar_dados(dt_inicio: str, dt_fim: str):
+    _di, _df = pd.Timestamp(dt_inicio), pd.Timestamp(dt_fim)
+    n_meses = max(1, (_df.year - _di.year) * 12 + (_df.month - _di.month) + 1)
     engine = get_engine()
 
     # Supervisor do técnico NO PERÍODO: vem da planilha do Relatório Mensal
@@ -424,12 +426,12 @@ WITH Parametros AS (
 ),
 
 -- ══════════════════════════════════════════════════════════
--- 1. CAP DE 30 VISITAS POR TÉCNICO (primeiras 30 por data)
+-- 1. CAP DE 30 VISITAS POR TÉCNICO **POR MÊS** (primeiras 30 de cada mês)
 -- ══════════════════════════════════════════════════════════
 VisitasComRank AS (
     SELECT *,
            ROW_NUMBER() OVER (
-               PARTITION BY tecnico_responsavel
+               PARTITION BY tecnico_responsavel, date_trunc('month', dt_visita_original)
                ORDER BY dt_visita_original ASC
            ) AS rn_visita
     FROM public.acompanhamento_mensal_visitas
@@ -437,7 +439,7 @@ VisitasComRank AS (
                         AND (SELECT dt_fim    FROM Parametros)
 ),
 
--- Apenas as primeiras 30 visitas de cada técnico no período
+-- Apenas as primeiras 30 visitas de cada técnico em cada mês do período
 VisitasCap AS (
     SELECT * FROM VisitasComRank WHERE rn_visita <= 30
 ),
@@ -478,19 +480,33 @@ UltimoStatusPropriedade AS (
 ),
 
 PropriedadesAtivasInativas AS (
-    -- 'SEM VÍNCULO' conta junto com 'ATIVA' de propósito: esse status não
-    -- significa que a propriedade está desativada — significa que ela não
-    -- tem registro na tabela auxiliar sisateg_vinculo_propriedade (comum em
-    -- projetos/propriedades mais novos, que ainda não populam essa tabela).
-    -- Sem essa soma, um técnico com trabalho real e válido no período (ex:
-    -- 56 visitas presenciais válidas em julho) ficava com propriedades_ativas
-    -- = 0 só por lacuna dessa tabela auxiliar, e sumia do ranking inteiro —
-    -- foi o caso do Francisco Erlandio e da Karina de Alencar.
-    SELECT tecnico_responsavel,
-           COUNT(DISTINCT CASE WHEN vinculo_status IN ('ATIVA', 'SEM VÍNCULO') THEN id_propriedade END) AS prop_ativas,
-           COUNT(DISTINCT CASE WHEN vinculo_status = 'INATIVA' THEN id_propriedade END) AS prop_inativas
-    FROM UltimoStatusPropriedade
-    GROUP BY tecnico_responsavel
+    -- Só conta as propriedades VISITADAS no período (distintas — a mesma
+    -- propriedade visitada em vários meses conta uma vez) e no máximo 30 por
+    -- técnico. Antes contava o histórico inteiro e passava de 30 (ex.: 78).
+    -- 'SEM VÍNCULO' conta junto com 'ATIVA': não significa propriedade
+    -- desativada, e sim ausência de registro na tabela auxiliar
+    -- sisateg_vinculo_propriedade (comum em projetos novos).
+    SELECT u.tecnico_responsavel,
+           LEAST(30, COUNT(DISTINCT CASE WHEN u.vinculo_status IN ('ATIVA', 'SEM VÍNCULO') THEN u.id_propriedade END)) AS prop_ativas,
+           COUNT(DISTINCT CASE WHEN u.vinculo_status = 'INATIVA' THEN u.id_propriedade END) AS prop_inativas
+    FROM UltimoStatusPropriedade u
+    WHERE EXISTS (
+        SELECT 1 FROM VisitasComRank v
+        WHERE v.tecnico_responsavel = u.tecnico_responsavel
+          AND v.id_propriedade = u.id_propriedade
+    )
+    GROUP BY u.tecnico_responsavel
+),
+
+-- Orientações do PERÍODO INTEIRO (somadas mês a mês, sem o cap de 30 visitas).
+OrientacoesPeriodo AS (
+    SELECT v.tecnico_responsavel,
+           SUM(COALESCE(CASE WHEN us.vinculo_status = 'ATIVA' THEN v.ori_total_geral ELSE 0 END, 0)) AS ori_total,
+           SUM(COALESCE(CASE WHEN us.vinculo_status = 'ATIVA' THEN v.ori_concluida   ELSE 0 END, 0)) AS ori_concl
+    FROM VisitasComRank v
+    LEFT JOIN UltimoStatusPropriedade us
+           ON v.id_propriedade = us.id_propriedade AND v.tecnico_responsavel = us.tecnico_responsavel
+    GROUP BY v.tecnico_responsavel
 ),
 
 -- ══════════════════════════════════════════════════════════
@@ -563,14 +579,15 @@ ResumoTecnicos AS (
         COUNT(*)                                                                        AS total_de_visitas,
         COUNT(CASE WHEN vc.visita_presencial = 'SIM' THEN 1 END)                          AS total_visitas_presenciais,
         COUNT(CASE WHEN vc.visita_valida = 'Valida' AND vc.visita_presencial = 'SIM' THEN 1 END) AS total_visitas_validas,
-        SUM(COALESCE(CASE WHEN usp.vinculo_status = 'ATIVA' THEN vc.ori_total_geral ELSE 0 END, 0))                                               AS total_orientacoes_geral,
-        SUM(COALESCE(CASE WHEN usp.vinculo_status = 'ATIVA' THEN vc.ori_concluida ELSE 0 END, 0))                                               AS total_orientacoes_concluidas
+        COALESCE(op.ori_total, 0) AS total_orientacoes_geral,
+        COALESCE(op.ori_concl, 0) AS total_orientacoes_concluidas
     FROM VisitasCap vc
+    LEFT JOIN OrientacoesPeriodo op ON vc.tecnico_responsavel = op.tecnico_responsavel
     LEFT JOIN PropriedadesAtivasInativas pai ON vc.tecnico_responsavel = pai.tecnico_responsavel
     LEFT JOIN PropriedadesInativasDoPeriodo pip ON vc.tecnico_responsavel = pip.tecnico_responsavel
     LEFT JOIN PropriedadesInativasDoAno pia ON vc.tecnico_responsavel = pia.tecnico_responsavel
     LEFT JOIN UltimoStatusPropriedade usp ON vc.id_propriedade = usp.id_propriedade AND vc.tecnico_responsavel = usp.tecnico_responsavel
-    GROUP BY vc.tecnico_responsavel, pai.prop_ativas, pip.prop_inativas_periodo, pia.prop_inativas_ano
+    GROUP BY vc.tecnico_responsavel, pai.prop_ativas, pip.prop_inativas_periodo, pia.prop_inativas_ano, op.ori_total, op.ori_concl
 ),
 
 Taxas AS (
@@ -578,9 +595,9 @@ Taxas AS (
         r.tecnico_responsavel,
         r.propriedades_ativas,
         r.propriedades_inativas,
-        r.total_de_visitas,
-        r.total_visitas_presenciais,
-        r.total_visitas_validas,
+        ROUND(r.total_de_visitas::NUMERIC / {n_meses}, 1)           AS total_de_visitas,
+        ROUND(r.total_visitas_presenciais::NUMERIC / {n_meses}, 1)  AS total_visitas_presenciais,
+        ROUND(r.total_visitas_validas::NUMERIC / {n_meses}, 1)      AS total_visitas_validas,
         r.total_orientacoes_geral,
         r.total_orientacoes_concluidas,
         CASE WHEN r.total_de_visitas > 0
@@ -1394,12 +1411,12 @@ df["pos_atividade"] = df.groupby("ultima_atividade", dropna=False)["nota_final"]
 df["pos_sup_anterior"] = df.groupby("ultimo_supervisor_anterior", dropna=False)["nota_final"].rank(method="dense", ascending=False).astype(int)
 
 # ── AVISO CAP ───────────────────────────────────────────────────────────────
-tecnicos_com_cap = (df["total_de_visitas"] == 30).sum()
+tecnicos_com_cap = (df["total_de_visitas"] >= 30).sum()
 if tecnicos_com_cap > 0:
     st.markdown(
         f'<div class="cap-aviso">⚠️ <strong>Cap de 30 visitas ativo:</strong> '
-        f'{tecnicos_com_cap} técnico(s) atingiram o limite — apenas as primeiras 30 visitas '
-        f'(por data) foram consideradas no cálculo.</div>',
+        f'{tecnicos_com_cap} técnico(s) atingiram o limite em todos os meses — só as primeiras 30 visitas '
+        f'de cada mês (por data) foram consideradas no cálculo.</div>',
         unsafe_allow_html=True
     )
 
