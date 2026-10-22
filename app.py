@@ -55,7 +55,7 @@ def _texto_celula_heatmap(row, col, colunas_absolutas):
     col_abs, fmt = colunas_absolutas[col]
     valor_abs = row[col_abs]
     if col == "n_avaliacao_subjetiva" and pd.isna(valor_abs):
-        return "—"
+        return "sem aval."
     return fmt.format(safe_float(valor_abs))
 
 
@@ -123,7 +123,14 @@ def montar_heatmap(df_plot, col_nome, indicadores, colunas_absolutas, abreviar=F
         xaxis=dict(side="top", tickangle=0, tickfont=dict(size=10, color="#14261a"), domain=[0, 0.94]),
         yaxis=dict(
             autorange="reversed", tickfont=dict(size=10, color="#14261a"), automargin=True,
-            tickvals=nomes, ticktext=[_abreviar_nome(n) for n in nomes] if abreviar else nomes,
+            tickvals=nomes,
+            ticktext=[
+                (_abreviar_nome(n) if abreviar else n) + (" ⚠️" if sem else "")
+                for n, sem in zip(
+                    nomes,
+                    df_plot["avaliacao_subjetiva"].isna().tolist() if col_nome == "tecnico_responsavel" and "avaliacao_subjetiva" in df_plot.columns else [False] * len(nomes),
+                )
+            ],
         ),
         annotations=annotations,
     )
@@ -144,27 +151,31 @@ def recalcular_scores(df_grupo):
     def clamp(serie, lo=5, hi=10):
         return serie.clip(lower=lo, upper=hi)
 
-    # Propriedades Ativas: 30=10, 29=9, 28=8, 27=7, 26=6, ≤25=5
-    df_g["n_prop_ativas"] = clamp(
-        (df_g["propriedades_ativas"].apply(safe_float).apply(lambda v: (v // 1) - 20))
+    # SEM PISO DE 5: a tabela oficial vale de 25 a 30 e abaixo disso a nota
+    # continua caindo (proporcional) até 0. Quem faz zero tira 0.
+    def nota_meta(v):
+        # Propriedades Ativas / Total de Visitas: 30=10, 29=9, 28=8, 27=7, 26=6, 25=5;
+        # abaixo de 25 cai proporcionalmente até 0 (0.2 ponto por visita).
+        v = safe_float(v) // 1
+        if v >= 25:
+            return min(10.0, v - 20)
+        return max(0.0, v * 0.2)
+
+    df_g["n_prop_ativas"] = df_g["propriedades_ativas"].apply(nota_meta) / 10.0
+    df_g["n_total_visitas"] = df_g["total_visitas_presenciais"].apply(nota_meta) / 10.0
+
+    # Propriedades Inativas (invertido): 0=10, 1=9, 2=8, ... 10 ou mais=0
+    df_g["n_prop_inativas"] = df_g["propriedades_inativas"].apply(safe_float).apply(
+        lambda v: max(0.0, min(10.0, 10 - (v // 1)))
     ) / 10.0
 
-    # Total de Visitas: 30=10, 29=9, 28=8, 27=7, 26=6, ≤25=5
-    df_g["n_total_visitas"] = clamp(
-        (df_g["total_visitas_presenciais"].apply(safe_float).apply(lambda v: (v // 1) - 20))
+    # Visitas Válidas (%) e Orientações Concluídas (%): nota proporcional ao percentual
+    # (100%=10, 97%=9,7, 50%=5, 9,7%=0,97, 0%=0) — sem degrau de 10 em 10.
+    df_g["n_taxa_validade"] = df_g["pct_visitas_validas"].apply(safe_float).apply(
+        lambda v: max(0.0, min(10.0, v / 10.0))
     ) / 10.0
-
-    # Propriedades Inativas (invertido): 0=10, 1=9, 2=8, 3=7, 4=6, ≥5=5
-    df_g["n_prop_inativas"] = clamp(
-        df_g["propriedades_inativas"].apply(safe_float).apply(lambda v: 10 - (v // 1))
-    ) / 10.0
-
-    # Visitas Válidas (%) e Orientações Concluídas (%): faixa por dezena, piso 5
-    df_g["n_taxa_validade"] = clamp(
-        df_g["pct_visitas_validas"].apply(safe_float).apply(lambda v: v // 10)
-    ) / 10.0
-    df_g["n_taxa_ori_concluidas"] = clamp(
-        df_g["pct_ori_concluidas"].apply(safe_float).apply(lambda v: v // 10)
+    df_g["n_taxa_ori_concluidas"] = df_g["pct_ori_concluidas"].apply(safe_float).apply(
+        lambda v: max(0.0, min(10.0, v / 10.0))
     ) / 10.0
 
     # Total de Orientações: faixas fixas com larguras diferentes
@@ -175,7 +186,7 @@ def recalcular_scores(df_grupo):
         if v >= 180: return 8
         if v >= 170: return 7
         if v >= 165: return 6
-        return 5
+        return 5.0 * max(0.0, v) / 164.0   # abaixo de 165: cai proporcionalmente até 0
     df_g["n_ori_geral"] = df_g["total_orientacoes_geral"].apply(nota_orientacoes) / 10.0
 
     # Repetição de Projeto: binário — 0 repetições=10, 1 ou mais=5
@@ -210,6 +221,7 @@ def recalcular_scores(df_grupo):
     df_g["pos"] = df_g["nota_final"].rank(method="dense", ascending=False).astype(int)
     return df_g
 
+@st.cache_resource
 def get_engine():
     url = URL.create(
         "postgresql+psycopg2",
@@ -219,9 +231,9 @@ def get_engine():
         port=int(os.getenv("REMOTE_DB_PORT", "6432")),
         database=os.getenv("REMOTE_DB_NAME", "painel_ateg"),
     )
-    return create_engine(url)
+    return create_engine(url, pool_pre_ping=True, pool_recycle=1800)
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def listar_tabelas():
     try:
         engine = get_engine()
@@ -236,7 +248,7 @@ def listar_tabelas():
     except Exception as e:
         return pd.DataFrame({"erro": [str(e)]})
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def fonte_do_supervisor():
     """Diz de onde o ranking está tirando o supervisor: (usa_planilha, qtd, banco)."""
     try:
@@ -250,7 +262,7 @@ def fonte_do_supervisor():
         return False, 0, "?"
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def buscar_dados(dt_inicio: str, dt_fim: str):
     _di, _df = pd.Timestamp(dt_inicio), pd.Timestamp(dt_fim)
     n_meses = max(1, (_df.year - _di.year) * 12 + (_df.month - _di.month) + 1)
@@ -385,15 +397,42 @@ def buscar_dados(dt_inicio: str, dt_fim: str):
 ),"""
     try:
         with engine.connect() as _c:
-            _tem_vinculo = _c.execute(
-                text("SELECT to_regclass('public.vinculo_tecnico') IS NOT NULL")
-            ).scalar()
-            _tem_tabela = _c.execute(
-                text("SELECT to_regclass('public.supervisor_tecnico_periodo') IS NOT NULL")
-            ).scalar()
+            _tem_vinculo, _tem_tabela, _tem_aval, _tem_vw = _c.execute(text(
+                "SELECT to_regclass('public.vinculo_tecnico') IS NOT NULL, "
+                "to_regclass('public.supervisor_tecnico_periodo') IS NOT NULL, "
+                "to_regclass('public.avaliacoes_tecnicos') IS NOT NULL, "
+                "to_regclass('public.vw_visitas') IS NOT NULL"
+            )).one()
     except Exception:
         _tem_vinculo = False
         _tem_tabela = False
+        _tem_aval = False
+        _tem_vw = False
+
+    # FONTE DAS VISITAS: a view public.vw_visitas (visita presencial/válida já como
+    # verdadeiro/falso, status e orientações prontos). Os nomes das colunas são
+    # traduzidos para os que o restante da consulta já usa. Sem a view, usa a
+    # tabela antiga acompanhamento_mensal_visitas.
+    if _tem_vw:
+        _cte_fonte = """Fonte AS (
+    SELECT id_visita,
+           id_propriedade,
+           dt_visita                  AS dt_visita_original,
+           tecnico                    AS tecnico_responsavel,
+           supervisor                 AS supervisor_atual,
+           NULL::text                 AS supervisor_anterior,
+           projeto,
+           projeto::text              AS id_projeto,
+           atividade,
+           CASE WHEN presencial THEN 'SIM' ELSE 'NAO' END       AS visita_presencial,
+           CASE WHEN valida     THEN 'Valida' ELSE 'Invalida' END AS visita_valida,
+           vinculo_status,
+           ori_total                  AS ori_total_geral,
+           ori_concluida
+    FROM public.vw_visitas
+),"""
+    else:
+        _cte_fonte = "Fonte AS (SELECT * FROM public.acompanhamento_mensal_visitas),"
     if _tem_vinculo:
         cte_supervisor_atual = cte_supervisor_atual_vinculo + "\n" + cte_tecnicos_vinculo_mes
     else:
@@ -410,16 +449,58 @@ def buscar_dados(dt_inicio: str, dt_fim: str):
         SELECT {_norm.format(c='t0.tecnico_responsavel')} FROM Taxas t0
         WHERE t0.tecnico_responsavel IS NOT NULL
     )
+    AND {_norm.format(c='tv.tecnico')} IN (
+        SELECT {_norm.format(c='a.tecnico')} FROM public.avaliacoes_tecnicos a
+        WHERE a.mes_referencia BETWEEN '{dt_inicio}' AND '{dt_fim}'
+          AND {_norm.format(c='a.supervisor')} = {_norm.format(c='tv.supervisor')}
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM public.vinculo_tecnico d
+        WHERE {_norm.format(c='d.tecnico')} = {_norm.format(c='tv.tecnico')}
+          AND d.motivo_desvinculacao LIKE 'Técnico desativado%'
+          AND NOT EXISTS (
+              SELECT 1 FROM public.vinculo_tecnico r
+              WHERE {_norm.format(c='r.tecnico')} = {_norm.format(c='d.tecnico')}
+                AND r.id <> d.id
+                AND (r.data_desvinculacao IS NULL OR r.data_inicio > d.data_desvinculacao)
+          )
+    )
 """
     else:
         _union_sem_visita = ""
+
+    # Técnico SEM VISITA no período NÃO aparece no ranking (mesmo avaliado):
+    # sem visita não há desempenho para ranquear.
+    _union_sem_visita = ""
+
+    # Quem SAIU (vínculo encerrado por "Técnico desativado" até o fim do mês final
+    # do período e sem novo vínculo depois) não entra no ranking.
+    if _tem_vinculo:
+        _fim_mes = ("(date_trunc('month', (SELECT dt_fim FROM Parametros))"
+                    " + interval '1 month - 1 day')::date")
+        _filtro_saiu = f"""
+    WHERE NOT EXISTS (
+        SELECT 1 FROM public.vinculo_tecnico d
+        WHERE {_norm.format(c='d.tecnico')} = {_norm.format(c='tecnico_responsavel')}
+          AND d.motivo_desvinculacao LIKE 'Técnico desativado%'
+          AND d.data_desvinculacao < {_fim_mes}
+          AND NOT EXISTS (
+              SELECT 1 FROM public.vinculo_tecnico r
+              WHERE {_norm.format(c='r.tecnico')} = {_norm.format(c='d.tecnico')}
+                AND r.id <> d.id
+                AND (r.data_desvinculacao IS NULL OR r.data_inicio > d.data_desvinculacao)
+          )
+    )"""
+    else:
+        _filtro_saiu = ""
     _join_tvm = (
         "    LEFT JOIN TecnicosVinculoMes tvm ON tvm.tecnico = t.tecnico_responsavel"
         if _tem_vinculo else "    LEFT JOIN (SELECT NULL::text AS tecnico, NULL::text AS supervisor) tvm ON FALSE"
     )
 
     query = f"""
-WITH Parametros AS (
+WITH {_cte_fonte}
+Parametros AS (
     SELECT
         '{dt_inicio}'::DATE AS dt_inicio,
         '{dt_fim}'::DATE    AS dt_fim
@@ -434,7 +515,7 @@ VisitasComRank AS (
                PARTITION BY tecnico_responsavel, date_trunc('month', dt_visita_original)
                ORDER BY dt_visita_original ASC
            ) AS rn_visita
-    FROM public.acompanhamento_mensal_visitas
+    FROM Fonte
     WHERE dt_visita_original BETWEEN (SELECT dt_inicio FROM Parametros)
                         AND (SELECT dt_fim    FROM Parametros)
 ),
@@ -447,15 +528,23 @@ VisitasCap AS (
 -- ══════════════════════════════════════════════════════════
 -- 2. HISTÓRICO GLOBAL (sem cap, para multi-projetos)
 -- ══════════════════════════════════════════════════════════
-HistoricoCompletoProjetos AS (
-    SELECT tecnico_responsavel, id_propriedade,
-           COUNT(DISTINCT id_projeto) AS total_projetos_por_propriedade
-    FROM public.acompanhamento_mensal_visitas
+ProjetosSertao AS (
+    -- normaliza só os nomes de projeto DISTINTOS (antes era linha a linha na tabela toda)
+    SELECT d.p
+    FROM (SELECT DISTINCT projeto::text AS p FROM Fonte) d
     WHERE regexp_replace(
-              translate(upper(coalesce(projeto::text, '')), 'ÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ', 'AAAAAEEEEIIIIOOOOOUUUUC'),
+              translate(upper(coalesce(d.p, '')), 'ÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ', 'AAAAAEEEEIIIIOOOOOUUUUC'),
               '\\s+', ' ', 'g'
-          ) NOT LIKE '%SERTAO EMPREENDEDOR%'
-    GROUP BY tecnico_responsavel, id_propriedade
+          ) LIKE '%SERTAO EMPREENDEDOR%'
+),
+HistoricoCompletoProjetos AS (
+    -- só os técnicos que têm visita no período (o resto nunca é usado)
+    SELECT m.tecnico_responsavel, m.id_propriedade,
+           COUNT(DISTINCT m.id_projeto) AS total_projetos_por_propriedade
+    FROM Fonte m
+    WHERE m.tecnico_responsavel IN (SELECT tecnico_responsavel FROM VisitasComRank)
+      AND NOT EXISTS (SELECT 1 FROM ProjetosSertao x WHERE x.p = m.projeto::text)
+    GROUP BY m.tecnico_responsavel, m.id_propriedade
 ),
 
 PropriedadesSobrepostasGlobal AS (
@@ -470,13 +559,16 @@ PropriedadesSobrepostasGlobal AS (
 -- 2B. STATUS MAIS RECENTE DE CADA PROPRIEDADE (GLOBAL)
 -- ══════════════════════════════════════════════════════════
 UltimoStatusPropriedade AS (
-    SELECT DISTINCT ON (tecnico_responsavel, id_propriedade)
-           tecnico_responsavel,
-           id_propriedade,
-           vinculo_status
-    FROM public.acompanhamento_mensal_visitas
-    WHERE tecnico_responsavel IS NOT NULL
-    ORDER BY tecnico_responsavel, id_propriedade, dt_visita_original DESC
+    SELECT DISTINCT ON (a.tecnico_responsavel, a.id_propriedade)
+           a.tecnico_responsavel,
+           a.id_propriedade,
+           a.vinculo_status
+    FROM Fonte a
+    WHERE a.tecnico_responsavel IS NOT NULL
+      AND EXISTS (SELECT 1 FROM VisitasComRank v
+                  WHERE v.tecnico_responsavel = a.tecnico_responsavel
+                    AND v.id_propriedade = a.id_propriedade)
+    ORDER BY a.tecnico_responsavel, a.id_propriedade, a.dt_visita_original DESC
 ),
 
 PropriedadesAtivasInativas AS (
@@ -516,17 +608,6 @@ PropriedadesInativasDoPeriodo AS (
     SELECT tecnico_responsavel,
            COUNT(DISTINCT CASE WHEN vinculo_status = 'INATIVA' THEN id_propriedade END) AS prop_inativas_periodo
     FROM VisitasComRank
-    GROUP BY tecnico_responsavel
-),
-
--- ══════════════════════════════════════════════════════════
--- 2D. PROPRIEDADES INATIVAS DO ANO (quando projeto NÃO selecionado)
--- ══════════════════════════════════════════════════════════
-PropriedadesInativasDoAno AS (
-    SELECT tecnico_responsavel,
-           COUNT(DISTINCT CASE WHEN vinculo_status = 'INATIVA' THEN id_propriedade END) AS prop_inativas_ano
-    FROM public.acompanhamento_mensal_visitas
-    WHERE EXTRACT(YEAR FROM dt_visita_original) = EXTRACT(YEAR FROM (SELECT dt_inicio FROM Parametros))
     GROUP BY tecnico_responsavel
 ),
 
@@ -571,10 +652,9 @@ ResumoTecnicos AS (
     SELECT
         vc.tecnico_responsavel,
         pai.prop_ativas AS propriedades_ativas,
-        CASE 
-            WHEN COALESCE(pip.prop_inativas_periodo, 0) > 0 THEN COALESCE(pip.prop_inativas_periodo, 0)
-            ELSE COALESCE(pia.prop_inativas_ano, 0)
-        END AS propriedades_inativas,
+        -- Só as inativas do PERÍODO escolhido (antes, sem inativa no período, caía
+        -- para as do ano inteiro e punia o técnico por meses anteriores).
+        COALESCE(pip.prop_inativas_periodo, 0) AS propriedades_inativas,
         COUNT(DISTINCT vc.id_propriedade)                                                 AS total_propriedades_distintas,
         COUNT(*)                                                                        AS total_de_visitas,
         COUNT(DISTINCT date_trunc('month', vc.dt_visita_original))                       AS meses_com_visita,
@@ -586,9 +666,8 @@ ResumoTecnicos AS (
     LEFT JOIN OrientacoesPeriodo op ON vc.tecnico_responsavel = op.tecnico_responsavel
     LEFT JOIN PropriedadesAtivasInativas pai ON vc.tecnico_responsavel = pai.tecnico_responsavel
     LEFT JOIN PropriedadesInativasDoPeriodo pip ON vc.tecnico_responsavel = pip.tecnico_responsavel
-    LEFT JOIN PropriedadesInativasDoAno pia ON vc.tecnico_responsavel = pia.tecnico_responsavel
     LEFT JOIN UltimoStatusPropriedade usp ON vc.id_propriedade = usp.id_propriedade AND vc.tecnico_responsavel = usp.tecnico_responsavel
-    GROUP BY vc.tecnico_responsavel, pai.prop_ativas, pip.prop_inativas_periodo, pia.prop_inativas_ano, op.ori_total, op.ori_concl
+    GROUP BY vc.tecnico_responsavel, pai.prop_ativas, pip.prop_inativas_periodo, op.ori_total, op.ori_concl
 ),
 
 Taxas AS (
@@ -647,10 +726,14 @@ NormalizadoBase AS (
         -- ══════════════════════════════════════════════════════
 
         -- Propriedades Ativas: 30=10, 29=9, 28=8, 27=7, 26=6, ≤25=5
-        LEAST(10, GREATEST(5, FLOOR(t.propriedades_ativas) - 20)) / 10.0 AS n_prop_ativas,
+        (CASE WHEN FLOOR(t.propriedades_ativas) >= 25
+              THEN LEAST(10, FLOOR(t.propriedades_ativas) - 20)
+              ELSE GREATEST(0, FLOOR(t.propriedades_ativas) * 0.2) END) / 10.0 AS n_prop_ativas,
 
         -- Total de Visitas: 30=10, 29=9, 28=8, 27=7, 26=6, ≤25=5
-        LEAST(10, GREATEST(5, FLOOR(t.total_visitas_presenciais) - 20)) / 10.0 AS n_total_visitas,
+        (CASE WHEN FLOOR(t.total_visitas_presenciais) >= 25
+              THEN LEAST(10, FLOOR(t.total_visitas_presenciais) - 20)
+              ELSE GREATEST(0, FLOOR(t.total_visitas_presenciais) * 0.2) END) / 10.0 AS n_total_visitas,
 
         -- Total de Orientações: faixas fixas com larguras diferentes
         (CASE
@@ -659,17 +742,17 @@ NormalizadoBase AS (
             WHEN t.total_orientacoes_geral >= 180 THEN 8
             WHEN t.total_orientacoes_geral >= 170 THEN 7
             WHEN t.total_orientacoes_geral >= 165 THEN 6
-            ELSE 5
+            ELSE 5.0 * GREATEST(0, t.total_orientacoes_geral) / 164.0
         END) / 10.0 AS n_ori_geral,
 
         -- Visitas Válidas (%): 100%=10, 90-99%=9, 80-89%=8, 70-79%=7 ... piso 5
-        LEAST(10, GREATEST(5, FLOOR((t.taxa_validade * 100) / 10))) / 10.0 AS n_taxa_validade,
+        LEAST(10, GREATEST(0, (t.taxa_validade * 100) / 10)) / 10.0 AS n_taxa_validade,
 
         -- Orientações Concluídas (%): mesma regra de faixa por dezena
-        LEAST(10, GREATEST(5, FLOOR((t.taxa_ori_concluidas * 100) / 10))) / 10.0 AS n_taxa_ori_concluidas,
+        LEAST(10, GREATEST(0, (t.taxa_ori_concluidas * 100) / 10)) / 10.0 AS n_taxa_ori_concluidas,
 
         -- Propriedades Inativas (invertido): 0=10, 1=9, 2=8, 3=7, 4=6, ≥5=5
-        LEAST(10, GREATEST(5, 10 - FLOOR(t.propriedades_inativas))) / 10.0 AS n_prop_inativas,
+        LEAST(10, GREATEST(0, 10 - FLOOR(t.propriedades_inativas))) / 10.0 AS n_prop_inativas,
 
         -- Repetição de Projeto: binário — 0 repetições=10, 1 ou mais=5
         (CASE WHEN t.qtd_multiplos_projetos = 0 THEN 10 ELSE 5 END) / 10.0 AS n_multi_projetos
@@ -707,7 +790,7 @@ Normalizado AS (
         CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_taxa_ori_concluidas END AS n_taxa_ori_concluidas,
         CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_prop_inativas END AS n_prop_inativas,
         CASE WHEN total_de_visitas = 0 THEN 0 ELSE n_multi_projetos END AS n_multi_projetos
-    FROM NormalizadoBase
+    FROM NormalizadoBase{_filtro_saiu}
 )
 SELECT
     tecnico_responsavel,
@@ -777,7 +860,7 @@ ORDER BY ultimo_supervisor, pos;
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=600, show_spinner=False)
 def buscar_avaliacoes_subjetivas(dt_inicio: str, dt_fim: str):
     """
     Busca a nota da avaliação subjetiva (lançada pelo supervisor no Sistema
@@ -806,7 +889,61 @@ def buscar_avaliacoes_subjetivas(dt_inicio: str, dt_fim: str):
         return pd.DataFrame(columns=["tecnico_responsavel", "avaliacao_subjetiva", "qtd_avaliacoes_subjetivas"])
 
 
-@st.cache_data(ttl=600)
+import unicodedata
+import re as _re
+
+
+def _norm_nome(v):
+    """Nome sem acento, maiúsculo e sem espaços repetidos (para comparar bases)."""
+    s = unicodedata.normalize("NFKD", str(v if v is not None else ""))
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return _re.sub(r"\s+", " ", s).strip().upper()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def buscar_avaliados_periodo(dt_inicio: str, dt_fim: str):
+    """
+    Todos os técnicos AVALIADOS pelo supervisor no período (tabela
+    avaliacoes_tecnicos), com a última visita registrada e, se houver, a data
+    em que o técnico saiu (uma linha por avaliação/mês). Usada na aba "Avaliados sem visitas no mês".
+    """
+    _n = ("trim(regexp_replace(translate(upper({c}), "
+          "'ÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ', 'AAAAAEEEEIIIIOOOOOUUUUC'), '\\s+', ' ', 'g'))")
+    # Lento antes: uma subconsulta por avaliação varrendo a tabela de visitas inteira
+    # (normalizando o nome em cada linha). Agora: UMA passada agrupada por nome.
+    query = text(f"""
+        WITH ult_raw AS (
+            SELECT tecnico_responsavel AS t, MAX(dt_visita_original) AS ultima_visita
+            FROM public.acompanhamento_mensal_visitas
+            GROUP BY tecnico_responsavel
+        ),
+        ult AS (
+            SELECT {_n.format(c='t')} AS k, MAX(ultima_visita) AS ultima_visita
+            FROM ult_raw GROUP BY 1
+        ),
+        sai AS (
+            SELECT {_n.format(c='tecnico')} AS k, MAX(data_desvinculacao) AS saiu_em
+            FROM public.vinculo_tecnico
+            WHERE motivo_desvinculacao LIKE 'Técnico desativado%'
+            GROUP BY 1
+        )
+        SELECT a.supervisor,
+               a.tecnico,
+               a.mes_referencia,
+               a.nota_final AS avaliacao,
+               u.ultima_visita,
+               sa.saiu_em
+        FROM public.avaliacoes_tecnicos a
+        LEFT JOIN ult u  ON u.k  = {_n.format(c='a.tecnico')}
+        LEFT JOIN sai sa ON sa.k = {_n.format(c='a.tecnico')}
+        WHERE a.mes_referencia BETWEEN :di AND :df
+    """)
+    engine = get_engine()
+    with engine.connect() as conn:
+        return pd.read_sql(query, conn, params={"di": dt_inicio, "df": dt_fim})
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def buscar_conflitos_propriedades():
     engine = get_engine()
     query = """
@@ -985,6 +1122,21 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Manrope:wght@400;500;600;700&display=swap');
 
+/* Durante um carregamento demorado, esconde os restos da tela anterior (ex.: login
+   desbotado). Cargas rápidas (< ~1s) não piscam. */
+@keyframes ghostfade { to { opacity: 0; } }
+[data-stale="true"] { animation: ghostfade .25s ease 1s forwards; }
+
+/* Tela de carregamento */
+.carregando{ display:flex; align-items:center; gap:16px; background:#fff; border:1px solid #e3ebe2;
+  border-left:4px solid #2f7d4f; border-radius:14px; padding:18px 22px; margin:18px 0;
+  box-shadow:0 4px 18px rgba(20,83,45,.08); }
+.carregando .spin{ width:26px; height:26px; border:3px solid #dbe8dd; border-top-color:#14532d;
+  border-radius:50%; animation:girar .8s linear infinite; flex-shrink:0; }
+.carregando b{ color:#14261a; font-size:.95rem; }
+.carregando span.sub{ display:block; color:#7d8f83; font-size:.78rem; margin-top:2px; }
+@keyframes girar { to { transform: rotate(360deg); } }
+
 /* ═══════════ VERDE AGRO — design tokens ═══════════ */
 :root{
   --bg:#f5f7f4; --surface:#ffffff; --surface-2:#eef2ec; --line:#e3ebe2;
@@ -1029,6 +1181,10 @@ div[data-testid="stDecoration"], div[data-testid="stToolbar"], div[data-testid="
     repeating-linear-gradient(90deg, rgba(255,255,255,.05) 0 1px, transparent 1px 34px);
 }
 .page-header > *{ position:relative; z-index:1; }
+.sessao-chips{ display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 12px; }
+.sessao-chips .chip{ display:inline-flex; align-items:center; gap:6px; font-size:.76rem; font-weight:600; color:#14532d;
+  background:#e8f1ea; border:1px solid #d3e3d7; border-radius:999px; padding:5px 12px; }
+.sessao-chips .chip.suave{ color:#4c5f51; background:#f1f4f0; border-color:#e3ebe2; font-weight:500; }
 .page-header h1{ margin:0; font-size:1.45rem; font-weight:700; }
 .page-header p{ margin:6px 0 0; font-size:.78rem; line-height:1.45; color:rgba(255,255,255,.78); max-width:74ch; }
 .badge{
@@ -1240,7 +1396,7 @@ st.markdown("""
 <div class="page-header">
     <div>
         <h1>🏆 Ranking de Performance ATeG</h1>
-        <p>8 indicadores com peso igual (12,5% cada, incluindo a avaliação subjetiva do supervisor) · máx. 30 visitas por técnico · comparação dentro do grupo</p>
+        <p>Notas de 0 a 10 por faixa em 7 indicadores objetivos, mais a avaliação do supervisor, todos com o mesmo peso · máx. 30 visitas por técnico por mês</p>
     </div>
     <span class="badge">Nota 0 a 100%</span>
 </div>
@@ -1249,11 +1405,12 @@ st.markdown("""
 col_user, col_logout = st.columns([5, 1])
 with col_user:
     _rotulo_sessao = "Administrador (vê todos os supervisores)" if st.session_state.get("admin") else f"Supervisor: {st.session_state.get('supervisor_logado')}"
-    st.caption(f"👤 {_rotulo_sessao}")
     _usa, _qtd, _banco = fonte_do_supervisor()
+    _chips = f'<span class="chip">👤 {_rotulo_sessao}</span>'
     if _usa and _qtd > 0:
-        st.caption(f"🧭 Supervisor pela planilha do Relatório Mensal ({_qtd:,} relatórios)".replace(",", "."))
-    else:
+        _chips += f'<span class="chip suave">🧭 Supervisor pela planilha do Relatório Mensal · {_qtd:,} relatórios</span>'.replace(",", ".")
+    st.markdown(f'<div class="sessao-chips">{_chips}</div>', unsafe_allow_html=True)
+    if not (_usa and _qtd > 0):
         st.warning(
             f"Supervisor ainda vindo da API: a tabela supervisor_tecnico_periodo "
             f"não foi encontrada (ou está vazia) no banco '{_banco}'."
@@ -1336,7 +1493,14 @@ dt_inicio = f"{ano_ini}-{mes_ini:02d}-01"
 dt_fim    = f"{ano_fim}-{mes_fim:02d}-{calendar.monthrange(ano_fim, mes_fim)[1]}"
 
 # ── DADOS ───────────────────────────────────────────────────────────────────
+_ph_carregando = st.empty()
+_ph_carregando.markdown(
+    f'''<div class="carregando"><div class="spin"></div>
+    <div><b>Carregando o ranking de {MESES[mes_ini]}/{ano_ini}{"" if (mes_ini, ano_ini) == (mes_fim, ano_fim) else f" a {MESES[mes_fim]}/{ano_fim}"}…</b>
+    <span class="sub">Calculando as notas dos técnicos. Isso pode levar alguns segundos.</span></div></div>''',
+    unsafe_allow_html=True)
 df = buscar_dados(dt_inicio, dt_fim)
+_ph_carregando.empty()
 if df is None or df.empty:
     st.warning("Nenhum dado encontrado para o período selecionado.")
     st.stop()
@@ -1410,6 +1574,9 @@ df["pos"] = df.groupby("ultimo_supervisor", dropna=False)["nota_final"].rank(met
 df["pos_projeto"] = df.groupby("ultimo_projeto", dropna=False)["nota_final"].rank(method="dense", ascending=False).astype(int)
 df["pos_atividade"] = df.groupby("ultima_atividade", dropna=False)["nota_final"].rank(method="dense", ascending=False).astype(int)
 df["pos_sup_anterior"] = df.groupby("ultimo_supervisor_anterior", dropna=False)["nota_final"].rank(method="dense", ascending=False).astype(int)
+
+# Técnicos que estão na classificação (usado na aba "Avaliados sem visitas no mês")
+_nomes_rank = set(df["tecnico_responsavel"].map(_norm_nome))
 
 # ── AVISO CAP ───────────────────────────────────────────────────────────────
 tecnicos_com_cap = (df["total_de_visitas"] >= 30).sum()
@@ -1967,7 +2134,7 @@ if df_sup.empty:
 df_sup = recalcular_scores(df_sup).sort_values("nota_final", ascending=False).reset_index(drop=True)
 
 
-tab1_tec, tab_dist_tec, tab2_tec = st.tabs(["🏆 Ranking", "📊 Distribuição de Propriedades x Orientações", "🔎 Detalhes por Técnico"])
+tab1_tec, tab_dist_tec, tab2_tec, tab_sem_visita = st.tabs(["🏆 Ranking", "📊 Distribuição de Propriedades x Orientações", "🔎 Detalhes por Técnico", "📭 Avaliados sem visitas"])
 with tab1_tec:
     # ── MÉTRICAS ─────────────────────────────────────────────────────────────────
     media_validas = df_sup[df_sup["total_de_visitas"] > 0]["pct_visitas_validas"].mean()
@@ -2149,7 +2316,7 @@ with tab2_tec:
         )
 
         with st.expander(
-            f"{medalha} {tec_nome}{cap_info}  ·  nota {nota*10:.2f}  "
+            f"{medalha} {tec_nome}{cap_info}{'  ⚠️ sem avaliação' if sem_avaliacao else ''}  ·  nota {nota*10:.2f}  "
             f"·  Válidas {safe_float(row['pct_visitas_validas']):.0f}%  "
             f"·  Orient. {safe_float(row['pct_ori_concluidas']):.0f}%{sup_ant_str}"
         ):
@@ -2296,3 +2463,105 @@ with tab2_tec:
         st.download_button("📥 Baixar CSV",   data=csv,      file_name=f"ranking_{sup}.csv",  mime="text/csv",                use_container_width=True)
     with col_xlsx:
         st.download_button("📊 Baixar Excel", data=xlsx_buf, file_name=f"ranking_{sup}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ABA: AVALIADOS SEM VISITAS NO MÊS (não entram na classificação)
+# ══════════════════════════════════════════════════════════════════════════
+with tab_sem_visita:
+    import html as _html
+    st.markdown("""<style>
+.sv-help{ font-size:.8rem; color:#7d8f83; margin:-4px 0 14px; line-height:1.4; }
+.sv-sup{ display:flex; align-items:center; gap:8px; font-family:'Sora',sans-serif; font-size:.78rem; font-weight:700;
+  letter-spacing:.06em; text-transform:uppercase; color:#14532d; margin:20px 0 8px; }
+.sv-sup .n{ background:#14532d; color:#fff; border-radius:999px; padding:1px 9px; font-size:.7rem; letter-spacing:0; }
+.sv-row{ display:flex; align-items:center; gap:12px; flex-wrap:wrap; background:#fff; border:1px solid #e3ebe2;
+  border-left:4px solid #c9d6cc; border-radius:12px; padding:10px 14px; margin-bottom:6px; transition:box-shadow .15s; }
+.sv-row:hover{ box-shadow:0 4px 14px rgba(20,83,45,.08); }
+.sv-row.saiu{ border-left-color:#c96a4d; } .sv-row.sem{ border-left-color:#d9a441; } .sv-row.prop{ border-left-color:#5b9e6f; }
+.sv-main{ flex:1 1 220px; min-width:0; }
+.sv-name{ display:block; font-weight:600; font-size:.87rem; color:#14261a; }
+.sv-sub{ display:block; font-size:.72rem; color:#7d8f83; margin-top:1px; }
+.sv-mes{ font-size:.74rem; font-weight:600; color:#4c5f51; background:#eef2ec; border-radius:999px; padding:3px 10px; font-variant-numeric:tabular-nums; }
+.sv-badge{ font-size:.72rem; font-weight:700; border-radius:999px; padding:4px 11px; white-space:nowrap; }
+.sv-badge.saiu{ background:#f8e3dc; color:#8a3a22; } .sv-badge.sem{ background:#fbf0d6; color:#7a5a12; } .sv-badge.prop{ background:#dcefe2; color:#1d5a35; }
+.sv-nota{ font-family:'Sora',sans-serif; font-weight:700; font-size:1.05rem; color:#14532d; min-width:58px; text-align:right; font-variant-numeric:tabular-nums; }
+.sv-nota small{ display:block; font-family:'Manrope',sans-serif; font-size:.6rem; font-weight:600; color:#9aa79d; letter-spacing:.06em; text-transform:uppercase; }
+.sv-nota.vazio{ font-size:.74rem; color:#9aa79d; font-weight:600; }
+</style>""", unsafe_allow_html=True)
+
+    st.markdown('<p class="section-title" style="margin-top:8px">📭 Avaliados sem visitas no mês</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sv-help">Técnicos que o supervisor avaliou no período, mas que não aparecem na classificação '
+                '(sem visitas no período ou sem propriedades ativas). Eles não entram no ranking.</p>', unsafe_allow_html=True)
+    try:
+        with st.spinner("Carregando avaliações..."):
+            df_av = buscar_avaliados_periodo(dt_inicio, dt_fim)
+    except Exception as _e:
+        df_av = pd.DataFrame()
+        st.warning(f"Não foi possível buscar as avaliações: {_e}")
+
+    if df_av.empty:
+        st.info("Nenhuma avaliação encontrada no período.")
+    else:
+        df_av = df_av[~df_av["tecnico"].map(_norm_nome).isin(_nomes_rank)].copy()
+
+        # mesmo recorte de supervisor usado no ranking
+        if not st.session_state.get("admin", False):
+            df_av = df_av[df_av["supervisor"].map(_norm_nome) == _norm_nome(st.session_state.get("supervisor_logado"))]
+        elif modo == "Supervisor Atual" and sup != "Todos":
+            df_av = df_av[df_av["supervisor"].map(_norm_nome) == _norm_nome(sup)]
+        if busca_tecnico.strip():
+            df_av = df_av[df_av["tecnico"].str.contains(busca_tecnico, case=False, na=False)]
+
+        if df_av.empty:
+            st.success("Todos os técnicos avaliados neste recorte aparecem na classificação.")
+        else:
+            df_av = df_av.copy()
+            df_av["_ult"] = pd.to_datetime(df_av["ultima_visita"], errors="coerce")
+            df_av["_saiu"] = pd.to_datetime(df_av["saiu_em"], errors="coerce")
+            df_av["_mes"] = pd.to_datetime(df_av["mes_referencia"], errors="coerce")
+            df_av["_nota"] = pd.to_numeric(df_av["avaliacao"], errors="coerce")
+            _ini, _fim = pd.Timestamp(dt_inicio), pd.Timestamp(dt_fim)
+
+            def _situacao(r):
+                if pd.notna(r["_saiu"]):
+                    return "saiu", f"Saiu em {r['_saiu']:%d/%m/%Y}"
+                if pd.isna(r["_ult"]):
+                    return "sem", "Nenhuma visita registrada"
+                if _ini <= r["_ult"] <= _fim:
+                    return "prop", "Sem propriedade ativa"
+                return "sem", "Sem visitas no período"
+
+            _sit = df_av.apply(_situacao, axis=1)
+            df_av["_tipo"] = [t for t, _ in _sit]
+            df_av["_txt"] = [x for _, x in _sit]
+            df_av = df_av.sort_values(["supervisor", "_mes", "_nota"], ascending=[True, True, False], na_position="last")
+
+            _tec = df_av.drop_duplicates("tecnico")
+            st.markdown(f"""<div class="metric-strip">
+<div class="metric-card"><div class="label">👥 Técnicos</div><div class="value">{len(_tec)}</div></div>
+<div class="metric-card red"><div class="label">🚪 Saíram</div><div class="value">{int((_tec['_tipo'] == 'saiu').sum())}</div></div>
+<div class="metric-card yellow"><div class="label">📭 Sem visitas</div><div class="value">{int((_tec['_tipo'] == 'sem').sum())}</div></div>
+<div class="metric-card green"><div class="label">🏠 Sem prop. ativa</div><div class="value">{int((_tec['_tipo'] == 'prop').sum())}</div></div>
+</div>""", unsafe_allow_html=True)
+
+            for _sup_nome, _g in df_av.groupby("supervisor", sort=True, dropna=False):
+                _linhas = []
+                for _, r in _g.iterrows():
+                    _nota = r["_nota"]
+                    _nota_html = (f'<div class="sv-nota">{_nota:.1f}'.replace(".", ",") + '<small>nota</small></div>') \
+                        if pd.notna(_nota) else '<div class="sv-nota vazio">Sem nota</div>'
+                    _ult = f"{r['_ult']:%d/%m/%Y}" if pd.notna(r["_ult"]) else "nunca"
+                    _mes = f"{r['_mes']:%m/%Y}" if pd.notna(r["_mes"]) else "—"
+                    _linhas.append(
+                        f'<div class="sv-row {r["_tipo"]}">'
+                        f'<div class="sv-main"><span class="sv-name">{_html.escape(str(r["tecnico"]))}</span>'
+                        f'<span class="sv-sub">Última visita: {_ult}</span></div>'
+                        f'<span class="sv-mes">Avaliação {_mes}</span>'
+                        f'<span class="sv-badge {r["_tipo"]}">{_html.escape(r["_txt"])}</span>'
+                        f'{_nota_html}</div>'
+                    )
+                st.markdown(
+                    f'<div class="sv-sup">👤 {_html.escape(str(_sup_nome))} <span class="n">{_g["tecnico"].nunique()}</span></div>'
+                    + "".join(_linhas),
+                    unsafe_allow_html=True)
