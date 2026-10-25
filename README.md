@@ -2,7 +2,7 @@
 
 ## Visão Geral
 
-OO Ranking de Performance ATeG é uma aplicação desenvolvida para monitorar, avaliar e classificar o desempenho dos técnicos de campo a partir dos dados registrados no sistema de acompanhamento de visitas.
+O Ranking de Performance ATeG é uma aplicação desenvolvida para monitorar, avaliar e classificar o desempenho dos técnicos de campo a partir dos dados registrados no sistema de acompanhamento de visitas.
 
 A solução foi construída para fornecer indicadores objetivos de produtividade, qualidade dos atendimentos e consistência cadastral, permitindo comparações justas entre profissionais que atuam sob a mesma supervisão ou dentro de um mesmo projeto.
 
@@ -50,7 +50,7 @@ Usuário Final
 Os dados são obtidos da tabela:
 
 ```sql
-public.acompanhamento_mensal_visitas
+public.vw_visitas
 ```
 Esta tabela concentra os registros operacionais das visitas realizadas pelos técnicos, incluindo:
 
@@ -67,8 +67,7 @@ Informações do produtor.
 
 # Indicadores Utilizados
 
-O ranking é composto por sete indicadores.
-
+A nota final é a média simples de **7 critérios objetivos**, mais a **avaliação do supervisor** (8º critério) quando ela existe. Todos têm o mesmo peso.
 
 | Indicador                      | Objetivo  |
 | ------------------------------ | --------- |
@@ -78,280 +77,50 @@ O ranking é composto por sete indicadores.
 | Taxa de Visitas Válidas        | Maximizar |
 | Taxa de Orientações Concluídas | Maximizar |
 | Propriedades Inativas          | Minimizar |
-| Propriedades Multi-Projeto     | Minimizar |
-
-Todos os indicadores possuem o mesmo peso na composição da nota final.
-
----
-
-# Metodologia de Cálculo
-
-## 1. Propriedades Ativas
-
-Quantidade de propriedades distintas com status:
-
-```sql
-vinculo_status = 'ATIVA'
-```
-
-Fórmula:
-
-```sql
-COUNT(DISTINCT id_propriedade)
-```
+| Repetição de Projeto           | Minimizar |
+| Avaliação do supervisor        | Maximizar |
 
 ---
 
-## 2. Propriedades Inativas
-
-Quantidade de propriedades distintas com status:
-
-```sql
-vinculo_status = 'INATIVA'
-```
-
-Fórmula:
-
-```sql
-COUNT(DISTINCT id_propriedade)
-```
-
----
-
-## 3. Total de Visitas
-
-Representa a quantidade total de visitas realizadas pelo técnico no período analisado.
-
-Fórmula:
-
-```sql
-COUNT(*)
-```
-
----
-
-## 4. Taxa de Visitas Válidas
-
-Mede a qualidade das visitas realizadas.
-
-Fórmula:
-
-```text
-Taxa de Visitas Válidas =
-Total de Visitas Válidas / Total de Visitas
-```
-
-Exemplo:
-
-```text
-90 visitas válidas
-100 visitas totais
-
-Taxa = 90%
-```
-
----
-
-## 5. Total de Orientações
-
-Quantidade total de orientações registradas.
-
-Fórmula:
-
-```sql
-SUM(ori_total_geral)
-```
-
----
-
-## 6. Taxa de Orientações Concluídas
-
-Avalia a efetividade das orientações realizadas.
-
-Fórmula:
-
-```text
-Taxa de Conclusão =
-Orientações Concluídas / Total de Orientações
-```
-
-Exemplo:
-
-```text
-80 orientações concluídas
-100 orientações registradas
-
-Taxa = 80%
-```
-
----
-
-## 7. Propriedades Multi-Projeto
-
-Identifica propriedades vinculadas simultaneamente a mais de um projeto.
-
-Exemplo:
-
-| ID Propriedade | Projeto       |
-| -------------- | ------------- |
-| 1001           | Bovinocultura |
-| 1001           | Apicultura    |
-
-Nesse caso a propriedade é considerada um conflito de projeto.
-
-O indicador contabiliza a quantidade de propriedades em situação de múltiplos projetos.
-
----
-
-# Normalização dos Indicadores
-
-Como os indicadores possuem escalas diferentes, todos são transformados para uma escala comum entre 0 e 1.
-
-A normalização é realizada dentro de cada grupo de supervisor.
-
----
-
-## Indicadores Positivos
-
-Quanto maior o valor, melhor o desempenho.
-
-Aplicado em:
-
-* Propriedades Ativas
-* Total de Visitas
-* Total de Orientações
-* Taxa de Visitas Válidas
-* Taxa de Orientações Concluídas
-
-Fórmula:
-
-```text
-(valor - mínimo) / (máximo - mínimo)
-```
-
-Resultado:
-
-| Situação              | Score |
-| --------------------- | ----- |
-| Melhor valor do grupo | 1,00  |
-| Pior valor do grupo   | 0,00  |
-
----
-
-## Indicadores Negativos
-
-Quanto menor o valor, melhor o desempenho.
-
-Aplicado em:
-
-* Propriedades Inativas
-* Multi-Projetos
-
-Fórmula:
-
-```text
-1 - ((valor - mínimo) / (máximo - mínimo))
-```
-
-Resultado:
-
-| Situação             | Score |
-| -------------------- | ----- |
-| Menor valor do grupo | 1,00  |
-| Maior valor do grupo | 0,00  |
-
----
-
-# Indicadores Normalizados
-
-Após a normalização, são gerados os seguintes campos:
-
-| Campo                 | Descrição                           |
-| --------------------- | ----------------------------------- |
-| n_prop_ativas         | Score de propriedades ativas        |
-| n_total_visitas       | Score de visitas                    |
-| n_ori_geral           | Score de orientações                |
-| n_taxa_validade       | Score de visitas válidas            |
-| n_taxa_ori_concluidas | Score de orientações concluídas     |
-| n_prop_inativas       | Score de propriedades inativas      |
-| n_multi_projetos      | Score de propriedades multi-projeto |
-
-Todos os scores variam entre:
-
-```text
-0,00 → pior desempenho
-1,00 → melhor desempenho
-```
+# Notas de 0 a 10 por indicador
+
+Cada indicador vira uma nota de 0 a 10 por faixas fixas (e não mais comparando com os outros técnicos do grupo). Assim a nota de um técnico não muda por causa do desempenho dos colegas.
+
+| Indicador | Regra |
+| --- | --- |
+| Propriedades Ativas | 30 ou mais = 10, 29 = 9, 28 = 8 ... 25 = 5. Abaixo de 25 cai 0,2 ponto por propriedade, até 0 |
+| Total de Visitas (máx. 30 por mês) | Mesma regra de Propriedades Ativas |
+| Propriedades Inativas | 10 menos o número de inativas visitadas no período (mínimo 0) |
+| Taxa de Visitas Válidas | % ÷ 10 (100% = 10, 87% = 8,7) |
+| Taxa de Orientações Concluídas | % ÷ 10 |
+| Total de Orientações | 220 ou mais = 10, 200 = 9, 180 = 8, 170 = 7, 165 = 6. Abaixo disso proporcional até 164 = 5 |
+| Repetição de Projeto | 10 se não houver propriedade em mais de um projeto, 5 se houver |
+| Avaliação do supervisor | A própria nota (0 a 10) lançada no Sistema de Avaliação |
+
+Observações:
+- Propriedades inativas contam só as visitadas **no período** escolhido.
+- O limite é de 30 visitas por técnico por mês.
 
 ---
 
 # Cálculo da Nota Final
 
-Todos os sete indicadores possuem exatamente o mesmo peso.
-
-Peso individual:
-
 ```text
-1 ÷ 7 = 14,2857%
+Nota Final = soma das notas dos critérios ÷ quantidade de critérios
 ```
 
-A nota final é calculada através da média simples dos indicadores normalizados.
+- Com avaliação do supervisor: 8 critérios (÷ 8).
+- Sem avaliação lançada: 7 critérios objetivos (÷ 7). A avaliação **não** entra como zero. O técnico aparece com o aviso "⚠️ sem avaliação" até o supervisor lançar.
 
-Fórmula:
-
-```text
-Nota Final =
-(
-n_prop_ativas +
-n_total_visitas +
-n_ori_geral +
-n_taxa_validade +
-n_taxa_ori_concluidas +
-n_prop_inativas +
-n_multi_projetos
-) / 7
-```
-
-A nota final também varia entre:
-
-```text
-0,00 e 1,00
-```
-
-ou
-
-```text
-0% e 100%
-```
+Exemplo (sem avaliação): 10 + 10 + 10 + 10 + 8 + 0 + 10 = 58, e 58 ÷ 7 = 8,29.
 
 ---
 
-# Penalização por Conflito de Projetos
+# Quem aparece no ranking
 
-Caso o técnico possua pelo menos uma propriedade vinculada a mais de um projeto:
-
-```text
-qtd_multiplos_projetos > 0
-```
-
-é aplicada uma penalização de 50% sobre a nota final.
-
-Fórmula:
-
-```text
-Nota Penalizada =
-Nota Final × 0,5
-```
-
-Exemplo:
-
-```text
-Nota Original = 0,84
-
-Nota Penalizada = 0,42
-```
-
-Essa regra foi criada para desestimular inconsistências cadastrais e sobreposição de projetos.
+- Só técnicos com **visitas no mês**. Técnico avaliado, mas sem visitas, aparece na aba "Avaliados sem visitas".
+- Técnicos que saíram (vínculo desativado) não aparecem.
+- Quem tem menos de 15 visitas no mês recebe o selo "🔸 poucas visitas".
 
 ---
 

@@ -20,6 +20,12 @@ def score_bar(val, cor="#2f7d4f"):
     return f'<div class="score-bar-wrap"><div class="score-bar-fill" style="width:{pct}%;background:{cor}"></div></div>'
 
 
+# Quem tem menos visitas que isso no mês recebe o selo "poucas visitas"
+# (as notas em % e os indicadores de "sem problema" ficam fáceis de tirar 10
+# com pouca atividade, então o selo avisa quem lê o ranking).
+POUCAS_VISITAS = 15
+
+
 def _valor_heatmap(row, col):
     """
     Valor a colorir na célula do heatmap (escala 0-1). Retorna None (célula
@@ -126,9 +132,10 @@ def montar_heatmap(df_plot, col_nome, indicadores, colunas_absolutas, abreviar=F
             tickvals=nomes,
             ticktext=[
                 (_abreviar_nome(n) if abreviar else n) + (" ⚠️" if sem else "")
-                for n, sem in zip(
+                for n, sem, poucas in zip(
                     nomes,
                     df_plot["avaliacao_subjetiva"].isna().tolist() if col_nome == "tecnico_responsavel" and "avaliacao_subjetiva" in df_plot.columns else [False] * len(nomes),
+                    (pd.to_numeric(df_plot["total_visitas_presenciais"], errors="coerce").fillna(0) < POUCAS_VISITAS).tolist() if col_nome == "tecnico_responsavel" and "total_visitas_presenciais" in df_plot.columns else [False] * len(nomes),
                 )
             ],
         ),
@@ -1042,21 +1049,64 @@ div[data-testid="stTextInput"] input:focus{ border-color:#2f7d4f !important; box
 .stButton button:hover{ background:#2f7d4f !important; border-color:#2f7d4f !important; }
 </style>"""
 
+def _logo_instituicao_base64():
+    """Logo da instituição (arquivo logo_instituicao.png ao lado do app.py), em base64."""
+    import base64
+    try:
+        caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo_instituicao.png")
+        with open(caminho, "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except Exception:
+        return ""
+
+
+_LOGIN_STYLE = """<style>
+.login-head{ background:linear-gradient(160deg,#0f4c2e 0%,#14532d 55%,#1d6b3d 100%); border-radius:16px 16px 0 0;
+  padding:16px 20px 14px; text-align:center; max-width:560px; margin:0 auto; }
+.login-head .logo-box{ background:#fff; display:inline-block; border-radius:10px; padding:6px 12px; margin-bottom:10px; }
+.login-head .logo-box img{ height:34px; width:auto; display:block; }
+.login-head h1{ margin:0; line-height:1.2; color:#fff; font-size:1.3rem; font-weight:700; font-family:'Sora',sans-serif !important; }
+.login-head p{ margin:2px 0 0; line-height:1.2; color:#cfe3d5; font-size:.78rem; }
+.block-container{ padding-top:1.2rem !important; }
+.st-key-login_card{ background:#fff; border-radius:0 0 16px 16px; padding:18px 28px 26px; max-width:560px; margin:0 auto;
+  border:1px solid #e3ebe2; border-top:none; box-shadow:0 14px 30px -22px rgba(20,38,26,.5); }
+.login-bemvindo{ font-size:1.05rem; font-weight:700; color:#14261a; margin:0; }
+.login-sub{ font-size:.8rem; color:#6b7d71; margin:2px 0 8px; }
+.login-seguro-topo{ font-size:.74rem; color:#2f7d4f; font-weight:600; margin:0 0 10px; }
+</style>"""
+
+
 def _tela_login():
     st.markdown(_AUTH_STYLE, unsafe_allow_html=True)
-    st.markdown("""
-    <div class="auth-hero">
-        <div class="auth-mark">🏆</div>
-        <h2>Ranking ATeG</h2>
-        <p>Acesso restrito — informe usuário e senha para continuar.</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(_LOGIN_STYLE, unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([1, 1.4, 1])
+    _logo = _logo_instituicao_base64()
+    _logo_html = (
+        f'<div class="logo-box"><img src="data:image/png;base64,{_logo}" alt="FAEC / SENAR Ceará"></div>'
+        if _logo else ""
+    )
+
+    col1, col2, col3 = st.columns([1, 1.7, 1])
     with col2:
-        login_digitado = st.text_input("Usuário", key="campo_usuario")
-        senha_digitada = st.text_input("Senha", type="password", key="campo_senha")
-        if st.button("Entrar", use_container_width=True):
+        st.markdown(f"""
+        <div class="login-head">
+            {_logo_html}
+            <h1>🏆 Ranking ATeG</h1>
+            <p>Desempenho, evolução e resultados</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.container(key="login_card"):
+            st.markdown("""
+            <p class="login-bemvindo">Bem-vindo!</p>
+            <p class="login-sub">Entre com suas credenciais para acessar o ranking.</p>
+            <p class="login-seguro-topo">🔒 Acesso seguro e restrito</p>
+            """, unsafe_allow_html=True)
+            login_digitado = st.text_input("Usuário", key="campo_usuario", placeholder="Digite seu usuário")
+            senha_digitada = st.text_input("Senha", type="password", key="campo_senha", placeholder="Digite sua senha")
+            entrar = st.button("Entrar no sistema  →", use_container_width=True)
+
+        if entrar:
             try:
                 dados_usuario = _buscar_usuario(login_digitado.strip().lower())
             except Exception as e:
@@ -1578,40 +1628,146 @@ df["pos_sup_anterior"] = df.groupby("ultimo_supervisor_anterior", dropna=False)[
 # Técnicos que estão na classificação (usado na aba "Avaliados sem visitas no mês")
 _nomes_rank = set(df["tecnico_responsavel"].map(_norm_nome))
 
-# ── AVISO CAP ───────────────────────────────────────────────────────────────
+# ── AVISO CAP (mostrado depois da busca, para não competir com ela) ─────────
 tecnicos_com_cap = (df["total_de_visitas"] >= 30).sum()
-if tecnicos_com_cap > 0:
-    st.markdown(
-        f'<div class="cap-aviso">⚠️ <strong>Cap de 30 visitas ativo:</strong> '
-        f'{tecnicos_com_cap} técnico(s) atingiram o limite em todos os meses — só as primeiras 30 visitas '
-        f'de cada mês (por data) foram consideradas no cálculo.</div>',
-        unsafe_allow_html=True
-    )
+_cap_html = (
+    f'<div class="cap-aviso">⚠️ <strong>Cap de 30 visitas ativo:</strong> '
+    f'{tecnicos_com_cap} técnico(s) atingiram o limite em todos os meses — só as primeiras 30 visitas '
+    f'de cada mês (por data) foram consideradas no cálculo.</div>'
+) if tecnicos_com_cap > 0 else ""
 
 # ── BUSCA/FILTRO DE TÉCNICO ────────────────────────────────────────────────────
 st.markdown("---")
+st.markdown("""
+<style>
+.busca-destaque{display:flex;align-items:center;gap:10px;margin:2px 0 6px}
+.busca-destaque .ico{background:#14532d;color:#fff;border-radius:10px;width:34px;height:34px;
+    display:flex;align-items:center;justify-content:center;font-size:1.05rem}
+.busca-destaque .tit{font-weight:700;color:#14261a;font-size:1.02rem;line-height:1.15}
+.busca-destaque .sub{color:#3d4f43;font-size:0.85rem}
+.st-key-busca_tecnico_input [data-baseweb="input"]{
+    height:52px;border:2px solid #2f7d4f !important;border-radius:12px !important;
+    background:#fff !important;box-shadow:0 2px 8px rgba(20,83,45,.12)}
+.st-key-busca_tecnico_input [data-baseweb="input"]:focus-within{
+    border-color:#14532d !important;box-shadow:0 0 0 3px rgba(47,125,79,.22)}
+.st-key-busca_tecnico_input [data-baseweb="base-input"]{background:transparent !important}
+.st-key-busca_tecnico_input input{font-size:1.05rem;padding-left:16px}
+.st-key-busca_tecnico_input label{display:none}
+.contador-tec{height:52px;border-radius:12px;background:#fff;border:1px solid #dfe8df;border-left:4px solid #2f7d4f;
+    display:flex;align-items:center;justify-content:space-between;padding:0 16px;box-shadow:0 1px 4px rgba(20,38,26,.06)}
+.contador-tec .l{font-size:0.72rem;letter-spacing:.06em;text-transform:uppercase;color:#5b6b60;font-weight:600}
+.contador-tec .v{font-size:1.5rem;font-weight:800;color:#14261a;line-height:1}
+</style>
+<div class="busca-destaque">
+  <div class="ico">🔍</div>
+  <div>
+    <div class="tit">Procure um técnico e veja a posição dele</div>
+    <div class="sub">Digite o nome (ou só um pedaço) e aperte Enter</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 col_search, col_count = st.columns([3, 1])
 with col_search:
     busca_tecnico = st.text_input(
-        "🔍 Buscar Técnico",
-        placeholder="Digite o nome ou parte do nome do técnico...",
-        help="Digite para filtrar a lista de técnicos"
+        "Buscar técnico",
+        placeholder="Ex.: Antônio, Moisés, Tiago...",
+        key="busca_tecnico_input",
+        label_visibility="collapsed",
     )
 with col_count:
-    _qtd_tecnicos = len(df) if not busca_tecnico.strip() else len(df[df["tecnico_responsavel"].str.contains(busca_tecnico, case=False, na=False)])
+    _qtd_tecnicos = len(df) if not busca_tecnico.strip() else int(df["tecnico_responsavel"].map(_norm_nome).str.contains(_norm_nome(busca_tecnico), na=False, regex=False).sum())
     st.markdown(f"""
-    <div class="metric-card green" style="margin-top:1px">
-        <div class="label">👥 Técnicos</div>
-        <div class="value">{_qtd_tecnicos}</div>
-    </div>
+    <div class="contador-tec"><span class="l">👥 Técnicos</span><span class="v">{_qtd_tecnicos}</span></div>
     """, unsafe_allow_html=True)
 
+# ── Tabela de posições de TODOS os técnicos (para baixar em Excel) ───────────
+# Montada ANTES do filtro da busca, para o arquivo sempre sair completo.
+import io as _io
+_g_geral = recalcular_scores(df.copy())            # posição entre TODOS os técnicos
+_pos_geral = dict(zip(_g_geral["tecnico_responsavel"], _g_geral["pos"].astype(int)))
+_df_pos_todos = pd.concat(                         # posição dentro de cada supervisor
+    [recalcular_scores(_g) for _, _g in df.groupby("ultimo_supervisor", dropna=False)],
+    ignore_index=True,
+)
+_df_pos_todos["_tam_grupo"] = _df_pos_todos.groupby("ultimo_supervisor", dropna=False)["tecnico_responsavel"].transform("count")
+_df_pos_todos = _df_pos_todos.sort_values(["ultimo_supervisor", "pos", "tecnico_responsavel"])
+_xl_pos = pd.DataFrame({
+    "Supervisor": _df_pos_todos["ultimo_supervisor"],
+    "Posição geral": _df_pos_todos["tecnico_responsavel"].map(_pos_geral).astype(int),
+    "Técnico": _df_pos_todos["tecnico_responsavel"],
+    "Posição no supervisor": _df_pos_todos["pos"].astype(int),
+    "Nota Final": (pd.to_numeric(_df_pos_todos["nota_final"], errors="coerce") * 10).round(2),
+    "Avaliação (Supervisor)": pd.to_numeric(_df_pos_todos["avaliacao_subjetiva"], errors="coerce").round(1),
+    "Propriedades Ativas": pd.to_numeric(_df_pos_todos["propriedades_ativas"], errors="coerce").fillna(0).astype(int),
+    "Propriedades Inativas": pd.to_numeric(_df_pos_todos["propriedades_inativas"], errors="coerce").fillna(0).astype(int),
+    "Visitas": pd.to_numeric(_df_pos_todos["total_visitas_presenciais"], errors="coerce").fillna(0).astype(int),
+    "% Visitas Válidas": pd.to_numeric(_df_pos_todos["pct_visitas_validas"], errors="coerce").round(1),
+    "Orientações": pd.to_numeric(_df_pos_todos["total_orientacoes_geral"], errors="coerce").fillna(0).astype(int),
+    "% Orientações Concluídas": pd.to_numeric(_df_pos_todos["pct_ori_concluidas"], errors="coerce").round(1),
+    "Total de técnicos no supervisor": _df_pos_todos["_tam_grupo"].astype(int),
+    "Aviso": [
+        " / ".join(x for x in (
+            "Sem avaliação do supervisor" if pd.isna(av) else "",
+            f"Poucas visitas (menos de {POUCAS_VISITAS})" if safe_float(vis) < POUCAS_VISITAS else "",
+        ) if x)
+        for av, vis in zip(_df_pos_todos["avaliacao_subjetiva"], _df_pos_todos["total_visitas_presenciais"])
+    ],
+})
+_xl_pos = _xl_pos.sort_values(["Posição geral", "Técnico"]).reset_index(drop=True)
+_xl_pos = _xl_pos[["Posição geral", "Técnico", "Supervisor", "Posição no supervisor", "Total de técnicos no supervisor",
+                   "Nota Final", "Avaliação (Supervisor)", "Propriedades Ativas", "Propriedades Inativas", "Visitas",
+                   "% Visitas Válidas", "Orientações", "% Orientações Concluídas", "Aviso"]]
+_xl_buf = _io.BytesIO()
+_xl_pos.to_excel(_xl_buf, index=False, sheet_name="Posições", engine="openpyxl")
+_xl_buf.seek(0)
+_sem_aval = _xl_pos[_xl_pos["Aviso"].str.contains("Sem avaliação", na=False)]
+_c_xl, _c_pend = st.columns([1.3, 2])
+with _c_xl:
+    st.download_button(
+        "📊 Baixar Excel das posições",
+        data=_xl_buf,
+        file_name="posicao_tecnicos.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help=f"Posição de todos os técnicos. Avisos no arquivo: sem avaliação do supervisor e poucas visitas (menos de {POUCAS_VISITAS} no mês).",
+        use_container_width=True,
+    )
+with _c_pend:
+    if not _sem_aval.empty:
+        with st.expander(f"⚠️ {len(_sem_aval)} sem avaliação do supervisor"):
+            st.caption("Nota calculada só com os 7 critérios objetivos até o supervisor lançar a avaliação.")
+            st.dataframe(_sem_aval[["Supervisor", "Técnico", "Posição no supervisor", "Nota Final"]],
+                         use_container_width=True, hide_index=True)
+
+if _cap_html:
+    st.markdown(_cap_html, unsafe_allow_html=True)
+
 if busca_tecnico.strip():
-    df = df[df["tecnico_responsavel"].str.contains(busca_tecnico, case=False, na=False)]
-    if df.empty:
+    # IMPORTANTE: o filtro da busca NÃO corta mais o df aqui. A posição de cada
+    # técnico precisa ser calculada com o GRUPO COMPLETO (supervisor) e só
+    # depois a lista é filtrada para mostrar quem foi pesquisado — senão o
+    # técnico pesquisado ficava sozinho no grupo e virava sempre "1º lugar".
+    _mask_busca = df["tecnico_responsavel"].map(_norm_nome).str.contains(_norm_nome(busca_tecnico), na=False, regex=False)
+    if not _mask_busca.any():
         st.warning(f"❌ Nenhum técnico encontrado com '{busca_tecnico}'")
         st.stop()
-    st.info(f"✅ {len(df)} técnico(s) encontrado(s) para '{busca_tecnico}'")
+    _c_info, _c_limpar = st.columns([4, 1])
+    with _c_info:
+        st.info(f"✅ {int(_mask_busca.sum())} técnico(s) encontrado(s) para '{busca_tecnico}'")
+    with _c_limpar:
+        st.button("✖ Limpar busca", key="btn_limpar_busca", use_container_width=True,
+                  on_click=lambda: st.session_state.update({"busca_tecnico_input": ""}))
+    # Resumo da posição de quem foi pesquisado (posição real, dentro do supervisor)
+    _res = _xl_pos[_xl_pos["Técnico"].map(_norm_nome).str.contains(_norm_nome(busca_tecnico), na=False, regex=False)]
+    st.dataframe(
+        _res[["Técnico", "Posição geral", "Supervisor", "Posição no supervisor", "Total de técnicos no supervisor", "Nota Final", "Avaliação (Supervisor)"]],
+        use_container_width=True, hide_index=True,
+        column_config={
+            "Posição no supervisor": st.column_config.NumberColumn(format="%d º"),
+            "Posição geral": st.column_config.NumberColumn(format="%d º", help=f"Posição real entre todos os {len(_xl_pos)} técnicos"),
+            "Nota Final": st.column_config.NumberColumn(format="%.2f"),
+            "Avaliação (Supervisor)": st.column_config.NumberColumn(format="%.1f"),
+        },
+    )
 st.markdown("---")
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2131,7 +2287,17 @@ if df_sup.empty:
     st.stop()
 
 # ── RECALCULA SCORES NO GRUPO (função definida no topo do arquivo) ──────────
-df_sup = recalcular_scores(df_sup).sort_values("nota_final", ascending=False).reset_index(drop=True)
+df_sup = recalcular_scores(df_sup)
+df_sup = df_sup.sort_values("nota_final", ascending=False).reset_index(drop=True)
+
+# Busca por técnico: filtra SÓ a exibição, depois de calcular as posições do grupo.
+if busca_tecnico.strip():
+    df_sup = df_sup[
+        df_sup["tecnico_responsavel"].map(_norm_nome).str.contains(_norm_nome(busca_tecnico), na=False, regex=False)
+    ].reset_index(drop=True)
+    if df_sup.empty:
+        st.warning("Esse técnico não está no grupo selecionado acima. Troque o filtro de supervisor para 'Todos'.")
+        st.stop()
 
 
 tab1_tec, tab_dist_tec, tab2_tec, tab_sem_visita = st.tabs(["🏆 Ranking", "📊 Distribuição de Propriedades x Orientações", "🔎 Detalhes por Técnico", "📭 Avaliados sem visitas"])
@@ -2164,12 +2330,42 @@ with tab1_tec:
     </div>
     """, unsafe_allow_html=True)
 
+    # ── Quantos técnicos desenhar na tela ────────────────────────────────────────
+    # Desenhar centenas de cartões/gráficos a cada clique é o que mais pesa no
+    # carregamento. Por padrão mostra os primeiros; "Mostrar todos" libera a lista.
+    # (O Excel e a busca sempre usam TODOS os técnicos.)
+    _LIMITE_TELA = 40
+    _n_render = len(df_sup) if (busca_tecnico.strip() or st.session_state.get("mostrar_todos_tec")) else _LIMITE_TELA
+    if len(df_sup) > _n_render:
+        st.markdown("""<style>
+        .st-key-barra_limite{ background:linear-gradient(135deg,#0f4c2e 0%,#14532d 60%,#1d6b3d 100%); border:1px solid #1d6b3d;
+            border-radius:14px; padding:12px 18px; margin:4px 0 14px; box-shadow:0 10px 22px -10px rgba(20,83,45,.8); }
+        .st-key-barra_limite p, .st-key-barra_limite span{ margin:0; font-size:.88rem; color:#f3d98b !important; }
+        .st-key-barra_limite strong{ color:#ffe9a8 !important; }
+        .st-key-btn_mostrar_todos button{ background:linear-gradient(180deg,#f6d776,#e0a82e) !important; color:#14532d !important;
+            border:none !important; border-radius:999px !important; height:42px; font-weight:800 !important; font-size:.88rem !important;
+            box-shadow:0 8px 18px -6px rgba(0,0,0,.55); transition:transform .12s, box-shadow .12s; }
+        .st-key-barra_limite .st-key-btn_mostrar_todos button p,
+        .st-key-barra_limite .st-key-btn_mostrar_todos button span,
+        .st-key-barra_limite .st-key-btn_mostrar_todos button div{ color:#14532d !important; font-weight:800 !important; }
+        .st-key-btn_mostrar_todos button:hover{ transform:translateY(-2px); box-shadow:0 12px 22px -6px rgba(0,0,0,.6);
+            background:linear-gradient(180deg,#ffe28a,#eab637) !important; color:#0f3d24 !important; }
+        </style>""", unsafe_allow_html=True)
+        with st.container(key="barra_limite"):
+            _c_lim1, _c_lim2 = st.columns([2.6, 1], vertical_alignment="center")
+            with _c_lim1:
+                st.markdown(f"👁️ Mostrando os **{_n_render} primeiros** de **{len(df_sup)}** técnicos. "
+                            f"Para achar um específico, use a busca.")
+            with _c_lim2:
+                st.button(f"Ver todos os {len(df_sup)} ↓", key="btn_mostrar_todos", use_container_width=True,
+                          on_click=lambda: st.session_state.update({"mostrar_todos_tec": True}))
+
     # ── RANKING + HEATMAP ────────────────────────────────────────────────────────
     col_rank, col_chart = st.columns([1, 1], gap="medium")
 
     with col_rank:
         st.markdown('<p class="section-title">Classificação</p>', unsafe_allow_html=True)
-        for _, row in df_sup.iterrows():
+        for _, row in df_sup.head(_n_render).iterrows():
             pos  = int(row["pos"])
             nota = safe_float(row["nota_final"])
             pct  = nota * 100
@@ -2209,7 +2405,7 @@ with tab1_tec:
             "n_avaliacao_subjetiva": ("avaliacao_subjetiva",        "{:.1f}"),
         }
 
-        chart_df = df_sup.sort_values("nota_final", ascending=False).copy()
+        chart_df = df_sup.sort_values("nota_final", ascending=False).head(_n_render).copy()
         fig = montar_heatmap(chart_df, "tecnico_responsavel", indicadores, colunas_absolutas, abreviar=True)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -2284,7 +2480,7 @@ with tab2_tec:
         _max_val = df_sup[_col].max()
         _lideres[_col] = set(df_sup.loc[df_sup[_col] == _max_val, "tecnico_responsavel"].tolist())
 
-    for _, row in df_sup.iterrows():
+    for _, row in df_sup.head(_n_render).iterrows():
         pos  = int(row["pos"])
         nota = safe_float(row["nota_final"])
         medalha  = "🥇" if pos==1 else "🥈" if pos==2 else "🥉" if pos==3 else f"#{pos}"
@@ -2316,7 +2512,7 @@ with tab2_tec:
         )
 
         with st.expander(
-            f"{medalha} {tec_nome}{cap_info}{'  ⚠️ sem avaliação' if sem_avaliacao else ''}  ·  nota {nota*10:.2f}  "
+            f"{medalha} {tec_nome}{cap_info}{'  ⚠️ sem avaliação' if sem_avaliacao else ''}{'  🔸 poucas visitas' if safe_float(row['total_visitas_presenciais']) < POUCAS_VISITAS else ''}  ·  nota {nota*10:.2f}  "
             f"·  Válidas {safe_float(row['pct_visitas_validas']):.0f}%  "
             f"·  Orient. {safe_float(row['pct_ori_concluidas']):.0f}%{sup_ant_str}"
         ):
