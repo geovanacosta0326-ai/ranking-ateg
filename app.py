@@ -240,6 +240,39 @@ def get_engine():
     )
     return create_engine(url, pool_pre_ping=True, pool_recycle=1800)
 
+
+def publicar_resultado_painel_visitas(xl, dt_inicio, dt_fim):
+    """Grava o resultado final (posição, nota, avaliação) de todos os técnicos do período em
+    public.ranking_resultado (servidor painel_ateg). O painel de visitas lê dessa tabela (aba Desempenho).
+    Republicar o mesmo período substitui o que já estava lá."""
+    d = pd.DataFrame({
+        "periodo_inicio": pd.to_datetime(dt_inicio).date(), "periodo_fim": pd.to_datetime(dt_fim).date(),
+        "tecnico": xl["Técnico"].values, "supervisor": xl["Supervisor"].values,
+        "posicao_geral": xl["Posição geral"].values, "posicao_supervisor": xl["Posição no supervisor"].values,
+        "tecnicos_no_supervisor": xl["Total de técnicos no supervisor"].values,
+        "nota_final": xl["Nota Final"].values, "avaliacao_supervisor": xl["Avaliação (Supervisor)"].values,
+        "propriedades_ativas": xl["Propriedades Ativas"].values, "propriedades_inativas": xl["Propriedades Inativas"].values,
+        "visitas": xl["Visitas"].values, "pct_visitas_validas": xl["% Visitas Válidas"].values,
+        "orientacoes": xl["Orientações"].values, "pct_ori_concluidas": xl["% Orientações Concluídas"].values,
+        "aviso": xl["Aviso"].values,
+    })
+    d["sem_avaliacao"] = d["avaliacao_supervisor"].isna()
+    with get_engine().begin() as c:
+        c.execute(text("""CREATE TABLE IF NOT EXISTS public.ranking_resultado (
+            periodo_inicio date NOT NULL, periodo_fim date NOT NULL, tecnico text NOT NULL, supervisor text,
+            posicao_geral int, posicao_supervisor int, tecnicos_no_supervisor int,
+            nota_final double precision, avaliacao_supervisor double precision, sem_avaliacao boolean,
+            propriedades_ativas int, propriedades_inativas int, visitas int,
+            pct_visitas_validas double precision, orientacoes int, pct_ori_concluidas double precision,
+            aviso text, publicado_em timestamp NOT NULL DEFAULT now(),
+            PRIMARY KEY (periodo_inicio, periodo_fim, tecnico))"""))
+        c.execute(text("DELETE FROM public.ranking_resultado WHERE periodo_inicio = :i AND periodo_fim = :f"),
+                  {"i": d["periodo_inicio"].iloc[0], "f": d["periodo_fim"].iloc[0]})
+        d.to_sql("ranking_resultado", c, schema="public", if_exists="append", index=False, method="multi", chunksize=200)
+        c.execute(text("""DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'painel_leitura')
+            THEN GRANT SELECT ON public.ranking_resultado TO painel_leitura; END IF; END $$"""))
+    return len(d)
+
 @st.cache_data(ttl=600, show_spinner=False)
 def listar_tabelas():
     try:
@@ -1737,6 +1770,29 @@ with _c_pend:
             st.caption("Nota calculada só com os 7 critérios objetivos até o supervisor lançar a avaliação.")
             st.dataframe(_sem_aval[["Supervisor", "Técnico", "Posição no supervisor", "Nota Final"]],
                          use_container_width=True, hide_index=True)
+
+# ── Envia o resultado ao painel de visitas SOZINHO (sem botão) ────────────────────────────
+# Só quando um ADMIN abre o ranking (o usuário comum vê só o próprio supervisor, o resultado sairia incompleto).
+# Mês encerrado: envia uma vez por sessão. Mês em andamento (parcial): reenvia a cada 30 minutos.
+# Abrir o mesmo período de novo substitui o que já estava no painel.
+import time as _time
+_hoje = date.today()
+_parcial = pd.to_datetime(dt_fim).date() >= _hoje
+if st.session_state.get("admin", False) and pd.to_datetime(dt_inicio).date() <= _hoje:
+    _chave_pub = f"pub_painel_{dt_inicio}_{dt_fim}"
+    _ult = st.session_state.get(_chave_pub)          # (quantidade, instante) do último envio
+    if _ult is None or (_parcial and _time.time() - _ult[1] > 1800):
+        try:
+            _ult = (publicar_resultado_painel_visitas(_xl_pos, dt_inicio, dt_fim), _time.time())
+        except Exception as _e_pub:
+            _ult = (-1, _time.time())
+            st.warning(f"Não consegui enviar o resultado ao painel de visitas: {_e_pub}")
+        st.session_state[_chave_pub] = _ult
+    if _ult[0] >= 0:
+        st.markdown(
+            f'<div style="margin:6px 0 10px;padding:10px 14px;border-radius:10px;background:#e7f4ea;border:1px solid #9fcfa9;'
+            f'color:#14532d;font-size:0.9rem;line-height:1.4;min-height:20px">✅ <strong>Resultado {"PARCIAL (mês em andamento) " if _parcial else ""}'
+            f'enviado ao painel de visitas</strong> ({_ult[0]} técnicos).</div>', unsafe_allow_html=True)
 
 if _cap_html:
     st.markdown(_cap_html, unsafe_allow_html=True)
