@@ -473,7 +473,14 @@ def buscar_dados(dt_inicio: str, dt_fim: str):
 ),"""
     else:
         _cte_fonte = "Fonte AS (SELECT * FROM public.acompanhamento_mensal_visitas),"
-    if _tem_vinculo:
+    if _tem_vinculo and _tem_vw:
+        # IGUAL AO PAINEL DE VISITAS: supervisor = o da última visita do técnico DENTRO DO PERÍODO
+        # escolhido (pelas visitas; o painel usa a mesma regra por mês). O vínculo só completa
+        # técnicos sem visita (TecnicosVinculoMes).
+        cte_supervisor_atual = cte_supervisor_atual_api + "\n" + cte_tecnicos_vinculo_mes
+    elif _tem_vinculo:
+        cte_supervisor_atual = cte_supervisor_atual_vinculo + "\n" + cte_tecnicos_vinculo_mes
+    elif False:
         cte_supervisor_atual = cte_supervisor_atual_vinculo + "\n" + cte_tecnicos_vinculo_mes
     else:
         cte_supervisor_atual = (
@@ -938,6 +945,85 @@ def _norm_nome(v):
     s = unicodedata.normalize("NFKD", str(v if v is not None else ""))
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return _re.sub(r"\s+", " ", s).strip().upper()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def buscar_todas_avaliacoes():
+    """Todas as avaliações lançadas (técnico, supervisor, mês) — usada só para explicar
+    o MOTIVO de um técnico estar 'sem avaliação' no período."""
+    try:
+        with get_engine().connect() as conn:
+            return pd.read_sql(text("SELECT tecnico, supervisor, mes_referencia FROM public.avaliacoes_tecnicos"), conn)
+    except Exception:
+        return pd.DataFrame(columns=["tecnico", "supervisor", "mes_referencia"])
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def buscar_vinculos_todos():
+    try:
+        with get_engine().connect() as conn:
+            return pd.read_sql(text("SELECT tecnico, supervisor, data_inicio, data_desvinculacao, motivo_desvinculacao FROM public.vinculo_tecnico"), conn)
+    except Exception:
+        return pd.DataFrame(columns=["tecnico", "supervisor", "data_inicio", "data_desvinculacao", "motivo_desvinculacao"])
+
+
+def motivo_vinculo(tecnico, dt_inicio, dt_fim):
+    """Descredenciamento (técnico desativado) ou troca de supervisor perto do período — explica a falta de avaliação."""
+    vv = buscar_vinculos_todos()
+    if vv.empty:
+        return ""
+    vv = vv[vv["tecnico"].map(_norm_nome) == _norm_nome(tecnico)].copy()
+    if vv.empty:
+        return ""
+    vv["_d"] = pd.to_datetime(vv["data_desvinculacao"], errors="coerce")
+    vv["_i"] = pd.to_datetime(vv["data_inicio"], errors="coerce")
+    di = pd.Timestamp(dt_inicio)
+    fim_mes = (pd.Timestamp(dt_fim) + pd.offsets.MonthEnd(0))
+    partes = []
+    desat = vv[vv["motivo_desvinculacao"].astype(str).str.startswith("Técnico desativado") & vv["_d"].notna()]
+    if not desat.empty:
+        d = desat["_d"].max()
+        partes.append(f"Técnico desativado/descredenciado em {d.strftime('%d/%m/%Y')}")
+    troca = vv[vv["motivo_desvinculacao"].astype(str).str.startswith("Mudança de supervisor") & vv["_d"].notna()
+               & (vv["_d"] >= di - pd.Timedelta(days=62)) & (vv["_d"] <= fim_mes + pd.Timedelta(days=31))]
+    for _, r in troca.sort_values("_d").iterrows():
+        novo_sup = vv[(vv["_i"] >= r["_d"] - pd.Timedelta(days=3)) & (vv["supervisor"] != r["supervisor"])]
+        para = f" para {novo_sup.sort_values('_i').iloc[0]['supervisor']}" if not novo_sup.empty else ""
+        partes.append(f"Trocou de supervisor em {r['_d'].strftime('%d/%m/%Y')} (de {r['supervisor']}{para})")
+    return "; ".join(partes)
+
+
+def motivo_sem_avaliacao(tecnico, supervisor, dt_inicio, dt_fim):
+    """Explica em uma frase por que o técnico não tem nota de avaliação no período."""
+    _vinc = motivo_vinculo(tecnico, dt_inicio, dt_fim)
+    _base = _motivo_aval_base(tecnico, supervisor, dt_inicio, dt_fim)
+    return (_vinc + " | " + _base) if _vinc else _base
+
+
+def _motivo_aval_base(tecnico, supervisor, dt_inicio, dt_fim):
+    ev = buscar_todas_avaliacoes()
+    if ev.empty:
+        return "Nenhuma avaliação encontrada na tabela de avaliações"
+    ev = ev.copy()
+    ev["_t"] = ev["tecnico"].map(_norm_nome)
+    ev["_s"] = ev["supervisor"].map(_norm_nome)
+    ev["_m"] = pd.to_datetime(ev["mes_referencia"], errors="coerce")
+    di, dfim = pd.Timestamp(dt_inicio), pd.Timestamp(dt_fim)
+    no_per = ev[(ev["_m"] >= di) & (ev["_m"] <= dfim)]
+    do_tec = ev[ev["_t"] == _norm_nome(tecnico)]
+    do_tec_per = do_tec[(do_tec["_m"] >= di) & (do_tec["_m"] <= dfim)]
+    if not do_tec_per.empty:
+        nomes = ", ".join(sorted(set(do_tec_per["tecnico"].astype(str))))
+        return f"Tem avaliação, mas o nome está escrito diferente ({nomes}) — não casou com o nome das visitas"
+    if not do_tec.empty:
+        meses = ", ".join(sorted({m.strftime("%m/%Y") for m in do_tec["_m"].dropna()}))
+        sups = ", ".join(sorted(set(do_tec["supervisor"].astype(str))))
+        return f"Não foi avaliado neste período; só tem avaliação em {meses} (supervisor: {sups})"
+    sup_per = no_per[no_per["_s"] == _norm_nome(supervisor)]
+    if sup_per.empty:
+        return "O supervisor não lançou nenhuma avaliação neste período"
+    n = sup_per["_t"].nunique()
+    return f"O supervisor avaliou {n} técnico(s) no período, mas não lançou avaliação para este técnico"
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -1746,30 +1832,41 @@ _xl_pos = pd.DataFrame({
         for av, vis in zip(_df_pos_todos["avaliacao_subjetiva"], _df_pos_todos["total_visitas_presenciais"])
     ],
 })
+_xl_pos["Motivo sem avaliação"] = [
+    motivo_sem_avaliacao(_t, _s, dt_inicio, dt_fim) if pd.isna(_av) else ""
+    for _t, _s, _av in zip(_xl_pos["Técnico"], _xl_pos["Supervisor"], _xl_pos["Avaliação (Supervisor)"])
+]
 _xl_pos = _xl_pos.sort_values(["Posição geral", "Técnico"]).reset_index(drop=True)
 _xl_pos = _xl_pos[["Posição geral", "Técnico", "Supervisor", "Posição no supervisor", "Total de técnicos no supervisor",
                    "Nota Final", "Avaliação (Supervisor)", "Propriedades Ativas", "Propriedades Inativas", "Visitas",
-                   "% Visitas Válidas", "Orientações", "% Orientações Concluídas", "Aviso"]]
-_xl_buf = _io.BytesIO()
-_xl_pos.to_excel(_xl_buf, index=False, sheet_name="Posições", engine="openpyxl")
-_xl_buf.seek(0)
-_sem_aval = _xl_pos[_xl_pos["Aviso"].str.contains("Sem avaliação", na=False)]
+                   "% Visitas Válidas", "Orientações", "% Orientações Concluídas", "Aviso", "Motivo sem avaliação"]]
 _c_xl, _c_pend = st.columns([1.3, 2])
-with _c_xl:
-    st.download_button(
-        "📊 Baixar Excel das posições",
-        data=_xl_buf,
-        file_name="posicao_tecnicos.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help=f"Posição de todos os técnicos. Avisos no arquivo: sem avaliação do supervisor e poucas visitas (menos de {POUCAS_VISITAS} no mês).",
-        use_container_width=True,
-    )
-with _c_pend:
-    if not _sem_aval.empty:
-        with st.expander(f"⚠️ {len(_sem_aval)} sem avaliação do supervisor"):
-            st.caption("Nota calculada só com os 7 critérios objetivos até o supervisor lançar a avaliação.")
-            st.dataframe(_sem_aval[["Supervisor", "Técnico", "Posição no supervisor", "Nota Final"]],
-                         use_container_width=True, hide_index=True)
+_slot_xl = _c_xl.empty()      # preenchido mais abaixo, DEPOIS dos filtros (Excel e lista seguem o filtro escolhido)
+_slot_pend = _c_pend.empty()
+
+
+def _preencher_excel_filtrado(_nomes_filtro):
+    """Mostra o botão do Excel e a lista 'sem avaliação' só com os técnicos do filtro atual."""
+    _f = _xl_pos[_xl_pos["Técnico"].map(_norm_nome).isin(_nomes_filtro)].reset_index(drop=True)
+    _buf = _io.BytesIO()
+    _f.to_excel(_buf, index=False, sheet_name="Posições", engine="openpyxl")
+    _buf.seek(0)
+    with _slot_xl.container():
+        st.download_button(
+            f"📊 Baixar Excel das posições ({len(_f)} técnicos)",
+            data=_buf,
+            file_name="posicao_tecnicos.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help=f"Posição dos técnicos do filtro escolhido. Avisos no arquivo: sem avaliação do supervisor (com o motivo) e poucas visitas (menos de {POUCAS_VISITAS} no mês).",
+            use_container_width=True,
+        )
+    _sa = _f[_f["Aviso"].str.contains("Sem avaliação", na=False)]
+    with _slot_pend.container():
+        if not _sa.empty:
+            with st.expander(f"⚠️ {len(_sa)} sem avaliação do supervisor"):
+                st.caption("Nota calculada só com os 7 critérios objetivos até o supervisor lançar a avaliação.")
+                st.dataframe(_sa[["Supervisor", "Técnico", "Posição no supervisor", "Nota Final", "Motivo sem avaliação"]],
+                             use_container_width=True, hide_index=True)
 
 # ── Envia o resultado ao painel de visitas SOZINHO (sem botão) ────────────────────────────
 # Só quando um ADMIN abre o ranking (o usuário comum vê só o próprio supervisor, o resultado sairia incompleto).
@@ -1830,6 +1927,7 @@ st.markdown("---")
 # PÁGINA: RANKING DE SUPERVISORES (mesmos parâmetros dos técnicos, agregados)
 # ══════════════════════════════════════════════════════════════════════════
 if pagina == "Ranking de Supervisores":
+    _preencher_excel_filtrado(set(_xl_pos["Técnico"].map(_norm_nome)))   # nesta página o Excel sai completo
     st.markdown('<p class="section-title" style="margin-top:4px">🏆 Ranking de Supervisores — Performance da Equipe</p>', unsafe_allow_html=True)
 
     # ── FILTRO — mesmas opções da página de Técnicos ────────────────────────
@@ -2354,6 +2452,9 @@ if busca_tecnico.strip():
     if df_sup.empty:
         st.warning("Esse técnico não está no grupo selecionado acima. Troque o filtro de supervisor para 'Todos'.")
         st.stop()
+
+# Excel + lista "sem avaliação" obedecem ao filtro escolhido (supervisor/projeto/atividade/técnico + busca)
+_preencher_excel_filtrado(set(df_sup["tecnico_responsavel"].map(_norm_nome)))
 
 
 tab1_tec, tab_dist_tec, tab2_tec, tab_sem_visita = st.tabs(["🏆 Ranking", "📊 Distribuição de Propriedades x Orientações", "🔎 Detalhes por Técnico", "📭 Avaliados sem visitas"])
